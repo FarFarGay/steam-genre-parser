@@ -1,0 +1,4 @@
+checkpoint.json
+*.csv
+parser_log.txt
+__pycache__/
