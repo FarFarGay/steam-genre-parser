@@ -111,9 +111,11 @@ Returns: total_reviews, total_positive, review_score_desc.
 ```
 GET https://store.steampowered.com/app/{appid}
 ```
-Tags are extracted from `InitAppTagData()` JavaScript call embedded in the page HTML. Top 10 tags by weight are captured.
+Tags are extracted from the `InitAppTagModal(appid, [...])` JavaScript call embedded in the page HTML (Steam renamed it from `InitAppTagData` at some point in 2026, which silently broke tag parsing until 2026-07-16). Top 20 tags by weight are captured.
 
-**Note:** Tag parsing may fail due to Steam rate limiting or page structure changes. When tags are empty, the tag-count filter is skipped (the game already passed tag pair discovery).
+The session carries age-gate cookies (`birthtime`, `lastagecheckage`, `wants_mature_content`) — without them, mature-rated games redirect to `/agecheck/` and return no tags.
+
+**Note:** Tag parsing may fail due to Steam rate limiting or page structure changes. When tags are empty, the tag-weight filter is skipped (the game already passed tag pair discovery).
 
 ### Rate Limiting
 
@@ -132,6 +134,7 @@ Every 25 processed games, the full state is written to `checkpoint.json`:
 
 ```json
 {
+  "config_hash": "md5 of tags/combos/weights/years",
   "appids": [700100, 700200, ...],
   "fetched": {
     "700100": { full game record },
@@ -146,6 +149,8 @@ Every 25 processed games, the full state is written to `checkpoint.json`:
 
 On restart with `--skip-discovery`, already-processed appids are skipped.
 
+`config_hash` fingerprints everything that affects dataset membership (tags, combos, weights, year range). A checkpoint built under a different config is discarded on load — otherwise old and new filter rules would silently mix. Transient fetch failures are NOT checkpointed, so the next run retries them. `KeyboardInterrupt` saves the checkpoint and still writes the partial CSVs.
+
 ## 5. Data Schema
 
 ### Per-Game Record (19 fields)
@@ -158,9 +163,10 @@ On restart with `--skip-discovery`, already-processed appids are skipped.
 | `publisher` | string | App Details | Publisher name(s), semicolon-separated |
 | `release_date` | string | App Details | ISO format YYYY-MM-DD |
 | `release_year` | int | Derived | Extracted from release_date |
-| `price_usd` | float | App Details | Current US price (0 for free, null if unavailable) |
+| `price_usd` | float | App Details | Base US price before discounts (`price_overview.initial`; 0 for free, null if unavailable) |
 | `is_free` | bool | App Details | Free-to-play flag |
-| `tags` | string | Store Page | Top 10 user tags, semicolon-separated |
+| `is_early_access` | bool | Derived | "Early Access" present in Steam genres |
+| `tags` | string | Store Page | Top 20 user tags, semicolon-separated |
 | `genres` | string | App Details | Official Steam genres, semicolon-separated |
 | `total_reviews` | int | Reviews API | Total user review count |
 | `positive_reviews` | int | Reviews API | Positive review count |
@@ -169,6 +175,7 @@ On restart with `--skip-discovery`, already-processed appids are skipped.
 | `platforms` | string | App Details | Comma-separated: windows, mac, linux |
 | `metacritic_score` | int/null | App Details | Metacritic score if available |
 | `header_image_url` | string | App Details | URL to store header image |
+| `steam_url` | string | Derived | Store page link for click-through |
 | `estimated_sales` | int | Calculated | Boxleiter formula |
 | `estimated_revenue_usd` | float | Calculated | Revenue estimate |
 
@@ -308,8 +315,8 @@ Python 3.10+ required (uses `X | Y` union type syntax).
 
 ## 13. Known Limitations
 
-- **Tag parsing unreliable**: Steam may block or change the page structure for `InitAppTagData`. When tags fail to parse, the tag-count filter is bypassed (safe because discovery already ensures 2+ relevant tags).
-- **Price is current, not launch price**: Games on sale or with price changes will show the current price, not the historical price at launch.
+- **Tag parsing unreliable**: Steam may block or change the page structure for `InitAppTagModal` (it already renamed the call once). When tags fail to parse, the tag-weight filter is bypassed (safe because discovery already ensures the game matched a tag pair).
+- **Price is current base price, not launch price**: discounts are excluded (`initial`), but permanent price changes since launch are not.
 - **Boxleiter is an approximation**: Actual sales can vary 2–3x from the estimate. The formula is best used for relative comparison within the dataset, not absolute numbers.
 - **No wishlist data**: Wishlists are not publicly available via Steam API.
 - **No concurrent player history**: Would require a separate Steam Charts scrape.

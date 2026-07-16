@@ -21,7 +21,9 @@ python parse_steam_genre.py
 ```
 
 ### Resume after interruption
-The script saves progress every 25 games to `checkpoint.json`. Just re-run the same command — it picks up where it left off.
+The script saves progress every 25 games to `checkpoint.json`. Just re-run the same command — it picks up where it left off. `Ctrl+C` is safe: the partial dataset is still written to CSV.
+
+Note: the checkpoint stores a fingerprint of the tag/filter config. If you change tags or filters, the old checkpoint is discarded automatically and the run starts fresh.
 
 ### Skip discovery phase (use cached appids)
 ```bash
@@ -52,9 +54,10 @@ python parse_steam_genre.py --skip-discovery
 | `developer` / `publisher` | Studio names |
 | `release_date` | ISO format (YYYY-MM-DD) |
 | `release_year` | Integer |
-| `price_usd` | Current US price |
+| `price_usd` | Base US price (before discounts) |
 | `is_free` | Boolean |
-| `tags` | Top 10 Steam user tags (semicolon-separated) |
+| `is_early_access` | Boolean (from Steam genres) |
+| `tags` | Top 20 Steam user tags (semicolon-separated) |
 | `genres` | Official Steam genres (semicolon-separated) |
 | `total_reviews` | Total user reviews |
 | `positive_reviews` | Positive review count |
@@ -62,6 +65,7 @@ python parse_steam_genre.py --skip-discovery
 | `review_score_desc` | e.g. "Very Positive", "Mixed" |
 | `platforms` | windows, mac, linux |
 | `metacritic_score` | If available |
+| `steam_url` | Store page link |
 | `estimated_sales` | Boxleiter formula: reviews × year multiplier |
 | `estimated_revenue_usd` | sales × price × 0.45 (after cuts/discounts/refunds) |
 

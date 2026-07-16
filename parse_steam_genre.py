@@ -7,6 +7,7 @@ and estimates sales using the Boxleiter formula.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -70,6 +71,13 @@ SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": "SurvivalRTSResearch/1.0 (research bot)",
     "Accept-Language": "en-US,en;q=0.9",
+})
+# Age-gated store pages redirect to /agecheck/ and lose the tag data;
+# these cookies pass the gate (verified 2026-07-16 on appid 1091500).
+SESSION.cookies.update({
+    "birthtime": "568022401",
+    "lastagecheckage": "1-January-1988",
+    "wants_mature_content": "1",
 })
 
 DELAY = 1.5
@@ -136,6 +144,7 @@ def discover_appids_for_tag_combo(tag_ids: list[int], combo_name: str) -> set[in
     """Scrape Steam search pages for a combination of tags, return set of appids."""
     appids = set()
     page = 0
+    total = 0
     tags_param = ",".join(str(t) for t in tag_ids)
 
     while True:
@@ -183,6 +192,9 @@ def discover_appids_for_tag_combo(tag_ids: list[int], combo_name: str) -> set[in
         time.sleep(1.0)
 
     tqdm.write(f"  [{combo_name}] done: {len(appids)} appids")
+    if total and len(appids) < total * 0.95:
+        tqdm.write(f"  WARNING: [{combo_name}] collected {len(appids)} of {total} — "
+                   f"pagination was cut short (rate limiting?), coverage is incomplete")
     return appids
 
 
@@ -264,15 +276,16 @@ def fetch_app_tags(appid: int) -> list[str]:
     if not resp:
         return []
 
-    # Tags are embedded in the page as InitAppTagData
-    match = re.search(r'InitAppTagData\(\s*\[(.+?)\]', resp.text, re.DOTALL)
+    # Tags are embedded in the page as InitAppTagModal(appid, [...])
+    # (Steam renamed InitAppTagData -> InitAppTagModal and prepended the appid)
+    match = re.search(r'InitAppTagModal\(\s*\d+\s*,\s*\[(.+?)\]', resp.text, re.DOTALL)
     if not match:
         return []
 
     try:
         raw = "[" + match.group(1) + "]"
         tags_data = json.loads(raw)
-        return [t.get("name", "") for t in tags_data[:10] if t.get("name")]
+        return [t.get("name", "") for t in tags_data[:20] if t.get("name")]
     except Exception:
         return []
 
@@ -316,9 +329,13 @@ def build_game_record(appid: int, details: dict, review_summary: dict, tags: lis
     if is_free:
         price_usd = 0.0
     elif price_data:
-        price_usd = price_data.get("final", 0) / 100.0
+        # "initial" is the base price; "final" is the current (possibly
+        # discounted) one. The 0.45 revenue coefficient already accounts for
+        # lifetime discounts, so using "final" would double-count sales.
+        price_usd = price_data.get("initial", price_data.get("final", 0)) / 100.0
 
     genres = [g.get("description", "") for g in details.get("genres", [])]
+    is_early_access = "Early Access" in genres
 
     platforms = details.get("platforms", {})
     platform_list = []
@@ -349,6 +366,7 @@ def build_game_record(appid: int, details: dict, review_summary: dict, tags: lis
         "release_year": release_year,
         "price_usd": price_usd,
         "is_free": is_free,
+        "is_early_access": is_early_access,
         "tags": "; ".join(tags),
         "genres": "; ".join(genres),
         "total_reviews": total_reviews,
@@ -358,6 +376,7 @@ def build_game_record(appid: int, details: dict, review_summary: dict, tags: lis
         "platforms": ", ".join(platform_list),
         "metacritic_score": metacritic_score,
         "header_image_url": details.get("header_image", ""),
+        "steam_url": f"https://store.steampowered.com/app/{appid}",
         "estimated_sales": est_sales,
         "estimated_revenue_usd": round(est_revenue, 2),
     }
@@ -406,14 +425,27 @@ def filter_game(record: dict, tags: list[str]) -> str | None:
 # Checkpoint
 # ---------------------------------------------------------------------------
 
+# Fingerprint of everything that affects which games end up in the dataset.
+# A checkpoint built under a different config would silently mix old and new
+# rules, so it is discarded instead.
+CONFIG_HASH = hashlib.md5(json.dumps(
+    [TARGET_TAGS, [c[0] for c in TAG_COMBOS], RELEVANT_TAG_WEIGHTS,
+     RELEVANT_WEIGHT_MIN, YEAR_MIN, YEAR_MAX],
+    sort_keys=True).encode()).hexdigest()
+
+
 def load_checkpoint() -> dict:
     if os.path.exists(CHECKPOINT_FILE):
         with open(CHECKPOINT_FILE, "r") as f:
-            return json.load(f)
-    return {"fetched": {}, "dropped": {}}
+            state = json.load(f)
+        if state.get("config_hash") == CONFIG_HASH:
+            return state
+        print("Checkpoint was built with a different tag/filter config — starting fresh")
+    return {"config_hash": CONFIG_HASH, "fetched": {}, "dropped": {}}
 
 
 def save_checkpoint(state: dict):
+    state["config_hash"] = CONFIG_HASH
     with open(CHECKPOINT_FILE, "w") as f:
         json.dump(state, f)
 
@@ -519,59 +551,63 @@ def main():
 
     print(f"  Already fetched: {len(already_done)}, remaining: {len(remaining)}")
 
-    for appid in tqdm(remaining, desc="Fetching"):
-        # 1. Get details
-        details = fetch_app_details(appid)
-        time.sleep(DELAY)
+    try:
+        for appid in tqdm(remaining, desc="Fetching"):
+            # 1. Get details
+            details = fetch_app_details(appid)
+            time.sleep(DELAY)
 
-        if not details:
-            drop_records.append({
-                "appid": appid, "name": "", "drop_reason": "failed to fetch details"
-            })
-            dropped[str(appid)] = drop_records[-1]
+            if not details:
+                # Transient failure (rate limit, network) — keep it out of the
+                # checkpoint so the next run retries instead of losing the game.
+                drop_records.append({
+                    "appid": appid, "name": "", "drop_reason": "failed to fetch details (will retry next run)"
+                })
+                count += 1
+                if count % CHECKPOINT_EVERY == 0:
+                    save_checkpoint(checkpoint)
+                continue
+
+            # Skip non-games (DLC, software, etc.)
+            app_type = details.get("type", "")
+            if app_type != "game":
+                drop_records.append({
+                    "appid": appid, "name": details.get("name", ""), "drop_reason": f"type={app_type}"
+                })
+                dropped[str(appid)] = drop_records[-1]
+                count += 1
+                if count % CHECKPOINT_EVERY == 0:
+                    save_checkpoint(checkpoint)
+                continue
+
+            # 2. Get reviews
+            review_summary = fetch_review_summary(appid)
+            time.sleep(DELAY)
+
+            # 3. Get tags
+            tags = fetch_app_tags(appid)
+            time.sleep(DELAY)
+
+            # Build record
+            record = build_game_record(appid, details, review_summary, tags)
+
+            # Filter
+            drop_reason = filter_game(record, tags)
+            if drop_reason:
+                record["drop_reason"] = drop_reason
+                drop_records.append(record)
+                dropped[str(appid)] = record
+            else:
+                records.append(record)
+                fetched[str(appid)] = record
+
             count += 1
             if count % CHECKPOINT_EVERY == 0:
+                checkpoint["fetched"] = fetched
+                checkpoint["dropped"] = dropped
                 save_checkpoint(checkpoint)
-            continue
-
-        # Skip non-games (DLC, software, etc.)
-        app_type = details.get("type", "")
-        if app_type != "game":
-            drop_records.append({
-                "appid": appid, "name": details.get("name", ""), "drop_reason": f"type={app_type}"
-            })
-            dropped[str(appid)] = drop_records[-1]
-            count += 1
-            if count % CHECKPOINT_EVERY == 0:
-                save_checkpoint(checkpoint)
-            continue
-
-        # 2. Get reviews
-        review_summary = fetch_review_summary(appid)
-        time.sleep(DELAY)
-
-        # 3. Get tags
-        tags = fetch_app_tags(appid)
-        time.sleep(DELAY)
-
-        # Build record
-        record = build_game_record(appid, details, review_summary, tags)
-
-        # Filter
-        drop_reason = filter_game(record, tags)
-        if drop_reason:
-            record["drop_reason"] = drop_reason
-            drop_records.append(record)
-            dropped[str(appid)] = record
-        else:
-            records.append(record)
-            fetched[str(appid)] = record
-
-        count += 1
-        if count % CHECKPOINT_EVERY == 0:
-            checkpoint["fetched"] = fetched
-            checkpoint["dropped"] = dropped
-            save_checkpoint(checkpoint)
+    except KeyboardInterrupt:
+        tqdm.write("\nInterrupted — saving checkpoint and writing partial CSV...")
 
     # Final save
     checkpoint["fetched"] = fetched
