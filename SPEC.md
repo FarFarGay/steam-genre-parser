@@ -2,7 +2,7 @@
 
 ## 1. Purpose
 
-Automated collection of a structured dataset of Steam games in the Action / Base Building / Physics / Destruction / Tower Defense genre cluster, released 2018–2025, with metadata sufficient to estimate sales volume and build a market landscape analysis.
+Automated collection of a structured dataset of Steam games in the Action / Base Building / Physics / Destruction / Tower Defense genre cluster, released 2018–2026, with metadata sufficient to estimate sales volume and build a market landscape analysis.
 
 The cluster definition pivoted on 2026-07-16: the game is defined through action (physical hand, destruction, melee) rather than RTS/strategy. RTS, Strategy, Real-Time with Pause and Action RTS tags were removed (Strategy sits on half of Steam — more noise than signal); Action, Physics, Destruction, Hack and Slash, Action RPG, Dungeon Crawler, Isometric, Top-Down and Mechs were added.
 
@@ -226,7 +226,7 @@ Games are dropped (with reason logged) if any condition is true:
 
 | # | Filter | Threshold | Rationale |
 |---|--------|-----------|-----------|
-| 1 | Release year | < 2018 or > 2025 | Scope limitation |
+| 1 | Release year | < 2018 or > 2026 | Scope limitation |
 | 2 | Review count | < 50 | Insufficient data for estimation |
 | 3 | Free-to-play | is_free = True | Premium segment only |
 | 4 | Price | < $3.00 | Removes asset flips and shovelware |

@@ -1,6 +1,6 @@
 """
 Steam Action Base-Building Genre Parser
-Collects metadata for Action/Base Building/Physics/Destruction/Tower Defense games (2018-2025)
+Collects metadata for Action/Base Building/Physics/Destruction/Tower Defense games (2018-2026)
 and estimates sales using the Boxleiter formula.
 """
 
@@ -65,7 +65,7 @@ RELEVANT_WEIGHT_MIN = 2.0
 NSFW_TAGS = {"Sexual Content", "NSFW", "Hentai", "Adult Only"}
 
 YEAR_MIN = 2018
-YEAR_MAX = 2025
+YEAR_MAX = 2026
 
 SESSION = requests.Session()
 SESSION.headers.update({

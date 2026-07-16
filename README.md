@@ -1,6 +1,6 @@
 # Steam Action Base-Building Genre Parser
 
-Collects metadata for Action/Base Building/Physics/Destruction/Tower Defense games on Steam (2018–2025) and estimates sales using the Boxleiter formula.
+Collects metadata for Action/Base Building/Physics/Destruction/Tower Defense games on Steam (2018–2026) and estimates sales using the Boxleiter formula.
 
 ## Setup
 
@@ -81,7 +81,7 @@ python parse_steam_genre.py --skip-discovery
 ## Filters applied
 
 Games are dropped if:
-- Release year outside 2018-2025
+- Release year outside 2018-2026
 - Fewer than 50 reviews
 - Free-to-play
 - Price under $3
