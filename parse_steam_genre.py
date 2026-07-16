@@ -1,8 +1,10 @@
 """
-Steam Survival RTS Genre Parser
-Collects metadata for Survival/RTS/Base Building/Colony Sim/Tower Defense games (2018-2025)
+Steam Action Base-Building Genre Parser
+Collects metadata for Action/Base Building/Physics/Destruction/Tower Defense games (2018-2025)
 and estimates sales using the Boxleiter formula.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -21,21 +23,43 @@ from tqdm import tqdm
 # Constants
 # ---------------------------------------------------------------------------
 
+# IDs verified against store.steampowered.com/tagdata/populartags/english (2026-07-16).
+# Old "Base Building"=4748 returned 0 results in Steam search; old "Colony Sim"=4094
+# pointed at an unrelated tag — both fixed here.
 TARGET_TAGS = {
-    "Survival": 1662,
-    "RTS": 4026,
-    "Base Building": 4748,
-    "Colony Sim": 4094,
+    "Action": 19,
+    "Base Building": 7332,
+    "Physics": 3968,
+    "Destruction": 5363,
     "Tower Defense": 1645,
-    "Strategy": 9,
-    "Real-Time with Pause": 5168,
-    "Action RTS": 4136,
+    "Survival": 1662,
+    "Colony Sim": 220585,
+    "Hack and Slash": 1646,
+    "Action RPG": 4231,
+    "Dungeon Crawler": 1720,
+    "Isometric": 5851,
+    "Top-Down": 4791,
+    "Mechs": 4821,
 }
 
-RELEVANT_TAG_NAMES = {
-    "Survival", "RTS", "Real Time Strategy", "Base Building",
-    "Colony Sim", "Tower Defense", "Action RTS", "Real-Time with Pause",
+# Weighted relevance for filter #6: a game must accumulate >= 2.0 to pass.
+# Colony Sim and Top-Down count as partial signal (0.5).
+RELEVANT_TAG_WEIGHTS = {
+    "Action": 1.0,
+    "Base Building": 1.0,
+    "Physics": 1.0,
+    "Destruction": 1.0,
+    "Tower Defense": 1.0,
+    "Survival": 1.0,
+    "Hack and Slash": 1.0,
+    "Action RPG": 1.0,
+    "Dungeon Crawler": 1.0,
+    "Isometric": 1.0,
+    "Mechs": 1.0,
+    "Colony Sim": 0.5,
+    "Top-Down": 0.5,
 }
+RELEVANT_WEIGHT_MIN = 2.0
 
 NSFW_TAGS = {"Sexual Content", "NSFW", "Hentai", "Adult Only"}
 
@@ -82,7 +106,9 @@ def estimate_revenue_usd(estimated_sales: int, price_usd: float) -> float:
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
-def polite_get(url: str, params: dict = None, max_retries: int = 3) -> requests.Response | None:
+# 6 retries with exponential backoff up to 64s: Steam's 429 bursts outlast
+# a 3-retry/8s ceiling, which silently truncated discovery pagination.
+def polite_get(url: str, params: dict = None, max_retries: int = 6) -> requests.Response | None:
     for attempt in range(max_retries):
         try:
             resp = SESSION.get(url, params=params, timeout=20)
@@ -162,28 +188,11 @@ def discover_appids_for_tag_combo(tag_ids: list[int], combo_name: str) -> set[in
 
 # Tag combos: pairs that define our genre cluster (intersection, not union)
 TAG_COMBOS = [
-    # Survival + X
-    ([1662, 4748], "Survival + Base Building"),
-    ([1662, 4026], "Survival + RTS"),
-    ([1662, 4094], "Survival + Colony Sim"),
-    ([1662, 1645], "Survival + Tower Defense"),
-    ([1662, 4136], "Survival + Action RTS"),
-    ([1662, 5168], "Survival + Real-Time with Pause"),
-    # RTS + X
-    ([4026, 4748], "RTS + Base Building"),
-    ([4026, 4094], "RTS + Colony Sim"),
-    ([4026, 1645], "RTS + Tower Defense"),
-    ([4026, 4136], "RTS + Action RTS"),
-    # Base Building + X
-    ([4748, 4094], "Base Building + Colony Sim"),
-    ([4748, 1645], "Base Building + Tower Defense"),
-    ([4748, 5168], "Base Building + Real-Time with Pause"),
-    # Colony Sim + X
-    ([4094, 1645], "Colony Sim + Tower Defense"),
-    ([4094, 5168], "Colony Sim + Real-Time with Pause"),
-    # Tower Defense + X
-    ([1645, 9], "Tower Defense + Strategy"),
-    ([1645, 4136], "Tower Defense + Action RTS"),
+    ([7332, 19], "Base Building + Action"),
+    ([7332, 3968], "Base Building + Physics"),
+    ([1645, 19], "Tower Defense + Action"),
+    ([7332, 5363], "Base Building + Destruction"),
+    ([1662, 7332], "Survival + Base Building"),
 ]
 
 
@@ -358,8 +367,8 @@ def build_game_record(appid: int, details: dict, review_summary: dict, tags: lis
 # Filtering
 # ---------------------------------------------------------------------------
 
-def count_relevant_tags(tags: list[str]) -> int:
-    return sum(1 for t in tags if t in RELEVANT_TAG_NAMES)
+def relevant_tag_weight(tags: list[str]) -> float:
+    return sum(RELEVANT_TAG_WEIGHTS.get(t, 0.0) for t in tags)
 
 
 def has_nsfw_tags(tags: list[str]) -> bool:
@@ -385,9 +394,10 @@ def filter_game(record: dict, tags: list[str]) -> str | None:
     if has_nsfw_tags(tags):
         return "NSFW tags"
 
-    # Only filter by tag count if we actually got tags (parsing can fail)
-    if tags and count_relevant_tags(tags) < 2:
-        return f"only {count_relevant_tags(tags)} relevant tag(s): {[t for t in tags if t in RELEVANT_TAG_NAMES]}"
+    # Only filter by tag weight if we actually got tags (parsing can fail)
+    if tags and relevant_tag_weight(tags) < RELEVANT_WEIGHT_MIN:
+        return (f"relevant tag weight {relevant_tag_weight(tags)} < {RELEVANT_WEIGHT_MIN}: "
+                f"{[t for t in tags if t in RELEVANT_TAG_WEIGHTS]}")
 
     return None
 

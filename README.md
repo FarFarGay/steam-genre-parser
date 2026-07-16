@@ -1,6 +1,6 @@
-# Steam Survival RTS Genre Parser
+# Steam Action Base-Building Genre Parser
 
-Collects metadata for Survival/RTS/Base Building/Colony Sim/Tower Defense games on Steam (2018–2025) and estimates sales using the Boxleiter formula.
+Collects metadata for Action/Base Building/Physics/Destruction/Tower Defense games on Steam (2018–2025) and estimates sales using the Boxleiter formula.
 
 ## Setup
 
@@ -82,4 +82,4 @@ Games are dropped if:
 - Free-to-play
 - Price under $3
 - NSFW/Sexual Content tags
-- Fewer than 2 relevant genre tags
+- Relevant tag weight below 2.0 (most cluster tags weigh 1.0; Colony Sim and Top-Down weigh 0.5)

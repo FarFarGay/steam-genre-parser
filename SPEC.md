@@ -1,8 +1,10 @@
-# Steam Survival RTS Genre Parser — Specification
+# Steam Action Base-Building Genre Parser — Specification
 
 ## 1. Purpose
 
-Automated collection of a structured dataset of Steam games in the Survival RTS / Base Building / Colony Sim / Tower Defense genre cluster, released 2018–2025, with metadata sufficient to estimate sales volume and build a market landscape analysis.
+Automated collection of a structured dataset of Steam games in the Action / Base Building / Physics / Destruction / Tower Defense genre cluster, released 2018–2025, with metadata sufficient to estimate sales volume and build a market landscape analysis.
+
+The cluster definition pivoted on 2026-07-16: the game is defined through action (physical hand, destruction, melee) rather than RTS/strategy. RTS, Strategy, Real-Time with Pause and Action RTS tags were removed (Strategy sits on half of Steam — more noise than signal); Action, Physics, Destruction, Hack and Slash, Action RPG, Dungeon Crawler, Isometric, Top-Down and Mechs were added.
 
 The output is a clean CSV ready for Excel analysis, pitch deck slides, and genre research.
 
@@ -32,29 +34,32 @@ Games are discovered via Steam Search API using **tag pair combinations** (inter
 
 ### Target Tags
 
-| Tag | Steam ID |
-|-----|----------|
-| Survival | 1662 |
-| RTS | 4026 |
-| Base Building | 4748 |
-| Colony Sim | 4094 |
-| Tower Defense | 1645 |
-| Strategy | 9 |
-| Real-Time with Pause | 5168 |
-| Action RTS | 4136 |
+IDs verified against `store.steampowered.com/tagdata/populartags/english` (2026-07-16). Two IDs from v1 were broken: "Base Building" 4748 returned 0 search results (correct: 7332), "Colony Sim" 4094 pointed at an unrelated tag (correct: 220585).
 
-### Tag Pair Combinations (17 total)
+| Tag | Steam ID | Role |
+|-----|----------|------|
+| Action | 19 | core — new game definition |
+| Base Building | 7332 | core |
+| Physics | 3968 | the hand |
+| Destruction | 5363 | destructibles |
+| Tower Defense | 1645 | kept from v1 |
+| Survival | 1662 | kept from v1 |
+| Colony Sim | 220585 | kept, half weight (seven dwarves ≠ colony) |
+| Hack and Slash | 1646 | melee |
+| Action RPG | 4231 | if progression survives playtests |
+| Dungeon Crawler | 1720 | dwarves go underground |
+| Isometric | 5851 | camera — catches Riftbreaker, Cult of the Lamb |
+| Top-Down | 4791 | adjacent camera, half weight |
+| Mechs | 4821 | piloted machine (Riftbreaker) |
+
+### Tag Pair Combinations (5 total)
 
 ```
-Survival + Base Building       Survival + RTS
-Survival + Colony Sim          Survival + Tower Defense
-Survival + Action RTS          Survival + Real-Time with Pause
-RTS + Base Building            RTS + Colony Sim
-RTS + Tower Defense            RTS + Action RTS
-Base Building + Colony Sim     Base Building + Tower Defense
-Base Building + Real-Time with Pause
-Colony Sim + Tower Defense     Colony Sim + Real-Time with Pause
-Tower Defense + Strategy       Tower Defense + Action RTS
+Base Building + Action          (primary)
+Base Building + Physics
+Tower Defense + Action
+Base Building + Destruction
+Survival + Base Building        (catches the old v1 shelf)
 ```
 
 ### API Endpoint
@@ -219,16 +224,13 @@ Games are dropped (with reason logged) if any condition is true:
 | 3 | Free-to-play | is_free = True | Premium segment only |
 | 4 | Price | < $3.00 | Removes asset flips and shovelware |
 | 5 | NSFW tags | "Sexual Content", "NSFW", "Hentai", "Adult Only" | Out of scope |
-| 6 | Relevant tags | < 2 (only when tags parsed successfully) | Must belong to genre cluster |
+| 6 | Relevant tag weight | < 2.0 (only when tags parsed successfully) | Must belong to genre cluster |
 
 Filters are applied in this order. First matching rule determines the drop reason.
 
-### Relevant Tag Names (for filter #6)
+### Relevant Tag Weights (for filter #6)
 
-```
-Survival, RTS, Real Time Strategy, Base Building,
-Colony Sim, Tower Defense, Action RTS, Real-Time with Pause
-```
+All target tags weigh 1.0, except partial signals at 0.5: **Colony Sim** (seven dwarves are not a colony) and **Top-Down** (adjacent camera, partial credit). A game must accumulate total weight ≥ 2.0 across its top-10 tags.
 
 ## 8. Output Files
 
