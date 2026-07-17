@@ -18,6 +18,7 @@ from pathlib import Path
 
 import pandas as pd
 import requests
+import yaml
 from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
@@ -73,6 +74,15 @@ YEAR_MAX = 2026
 # 2016+: games registered in 2016-2017 but released 2018+ were silently lost
 # under the old 700000 cutoff; the year filter drops actual pre-2018 releases.
 MIN_APPID = 400000
+
+MIN_PRICE_USD = 3.0
+ALLOW_FREE_TO_PLAY = False
+
+# Output file names; a custom cluster config renames them to {name}_*.csv so
+# two clusters can live side by side. Defaults keep the historical v1 names.
+DATASET_CSV = "survival_rts_dataset.csv"
+DROPPED_CSV = "survival_rts_dropped.csv"
+UNBORN_CSV = "unborn.csv"
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -286,6 +296,108 @@ def verify_tag_ids():
                          f"returns 0 search results — fix before running")
             time.sleep(1.0)
     print("Tag ids verified OK")
+
+
+# ---------------------------------------------------------------------------
+# Cluster config (bring-your-own-cluster)
+# ---------------------------------------------------------------------------
+
+def resolve_tag_ids(names: list[str], explicit: dict[str, int]) -> dict[str, int]:
+    """Resolve tag names to Steam tag ids via the official popular-tags list.
+
+    Users write tag names exactly as shown on Steam; nobody should have to
+    hunt numeric ids. Tags outside Steam's top-430 popular list can't be
+    resolved by name — those need an explicit id in the config's tag_ids
+    section (ids are listed on steamdb.info/tags). Explicit ids are probed
+    with a live search so a typo'd id fails fast instead of parsing nothing.
+    """
+    resp = polite_get("https://store.steampowered.com/tagdata/populartags/english")
+    if not resp:
+        sys.exit("Could not fetch Steam's tag list to resolve tag names — check connectivity and retry")
+    try:
+        by_name = {t["name"].lower(): t["tagid"] for t in resp.json()}
+    except Exception:
+        sys.exit("Could not parse Steam's tag list — retry later")
+
+    resolved = {}
+    for name in names:
+        if name in explicit:
+            tid = int(explicit[name])
+            probe = polite_get("https://store.steampowered.com/search/results/",
+                               {"query": "", "count": 1, "tags": tid, "infinite": 1})
+            total = 0
+            if probe:
+                try:
+                    total = probe.json().get("total_count", 0)
+                except Exception:
+                    pass
+            if not total:
+                sys.exit(f"tag_ids[\"{name}\"] = {tid} returns 0 games in Steam search — "
+                         f"wrong id? Check steamdb.info/tags")
+            resolved[name] = tid
+            time.sleep(1.0)
+        elif name.lower() in by_name:
+            resolved[name] = by_name[name.lower()]
+        else:
+            sys.exit(f"Unknown tag \"{name}\": not in Steam's popular-tags list. "
+                     f"Add its numeric id under tag_ids: in the config "
+                     f"(find it on steamdb.info/tags)")
+    return resolved
+
+
+def apply_cluster_config(path: str):
+    """Load a YAML cluster config and rewire the module constants.
+
+    One engine, many clusters: the config only parameterizes tags, pairs,
+    filters and output names — the parsing logic stays identical. Output
+    files and the checkpoint get the cluster's name so several clusters can
+    live side by side in this folder.
+    """
+    global TARGET_TAGS, RELEVANT_TAG_WEIGHTS, RELEVANT_WEIGHT_MIN, TAG_COMBOS
+    global YEAR_MIN, YEAR_MAX, MIN_APPID, MIN_PRICE_USD, ALLOW_FREE_TO_PLAY
+    global DATASET_CSV, DROPPED_CSV, UNBORN_CSV, CHECKPOINT_FILE, CONFIG_HASH
+
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    name = re.sub(r"[^\w-]+", "_", str(cfg.get("name", "custom")).strip()) or "custom"
+
+    weights = cfg.get("tags") or {}
+    if not weights:
+        sys.exit("Config must define tags: {TagName: weight, ...}")
+    weights = {str(k): float(v) for k, v in weights.items()}
+
+    pairs = cfg.get("pairs") or []
+    if not pairs:
+        sys.exit("Config must define pairs: [[TagA, TagB], ...]")
+    for p in pairs:
+        if not isinstance(p, list) or len(p) != 2:
+            sys.exit(f"Each pair must be [TagA, TagB], got: {p!r}")
+        for t in p:
+            if t not in weights:
+                sys.exit(f"Pair tag \"{t}\" is missing from tags: — every pair tag needs a weight")
+
+    explicit = {str(k): int(v) for k, v in (cfg.get("tag_ids") or {}).items()}
+    TARGET_TAGS = resolve_tag_ids(list(weights.keys()), explicit)
+    RELEVANT_TAG_WEIGHTS = weights
+    RELEVANT_WEIGHT_MIN = float(cfg.get("weight_min", RELEVANT_WEIGHT_MIN))
+    TAG_COMBOS = [([TARGET_TAGS[a], TARGET_TAGS[b]], f"{a} + {b}") for a, b in pairs]
+
+    years = cfg.get("years") or [YEAR_MIN, YEAR_MAX]
+    YEAR_MIN, YEAR_MAX = int(years[0]), int(years[1])
+    MIN_APPID = int(cfg.get("min_appid", MIN_APPID))
+    MIN_PRICE_USD = float(cfg.get("min_price_usd", MIN_PRICE_USD))
+    ALLOW_FREE_TO_PLAY = bool(cfg.get("allow_free_to_play", ALLOW_FREE_TO_PLAY))
+
+    DATASET_CSV = f"{name}_dataset.csv"
+    DROPPED_CSV = f"{name}_dropped.csv"
+    UNBORN_CSV = f"{name}_unborn.csv"
+    CHECKPOINT_FILE = f"checkpoint_{name}.json"
+    CONFIG_HASH = compute_config_hash()
+
+    print(f'Cluster "{name}": {len(weights)} tags, {len(pairs)} pairs, '
+          f"years {YEAR_MIN}-{YEAR_MAX}, min price ${MIN_PRICE_USD}, "
+          f"outputs {name}_*.csv")
 
 
 # ---------------------------------------------------------------------------
@@ -554,12 +666,12 @@ def filter_pre_tags(record: dict) -> str | None:
     if year is None or year < YEAR_MIN or year > YEAR_MAX:
         return f"release_year={year} outside {YEAR_MIN}-{YEAR_MAX}"
 
-    if record.get("is_free"):
+    if record.get("is_free") and not ALLOW_FREE_TO_PLAY:
         return "is_free=True"
 
     price = record.get("price_usd")
-    if price is not None and price < 3:
-        return f"price_usd={price} < 3"
+    if price is not None and price < MIN_PRICE_USD:
+        return f"price_usd={price} < {MIN_PRICE_USD}"
 
     return None
 
@@ -586,13 +698,19 @@ def filter_by_tags(tag_names: list[str]) -> str | None:
 # the tag/filter config itself is unchanged.
 SCHEMA_VERSION = 3
 
+
 # Fingerprint of everything that affects which games end up in the dataset.
 # A checkpoint built under a different config would silently mix old and new
-# rules, so it is discarded instead.
-CONFIG_HASH = hashlib.md5(json.dumps(
-    [TARGET_TAGS, [c[0] for c in TAG_COMBOS], RELEVANT_TAG_WEIGHTS,
-     RELEVANT_WEIGHT_MIN, YEAR_MIN, YEAR_MAX, MIN_APPID, SCHEMA_VERSION],
-    sort_keys=True).encode()).hexdigest()
+# rules, so it is discarded instead. Recomputed after a cluster config loads.
+def compute_config_hash() -> str:
+    return hashlib.md5(json.dumps(
+        [TARGET_TAGS, [c[0] for c in TAG_COMBOS], RELEVANT_TAG_WEIGHTS,
+         RELEVANT_WEIGHT_MIN, YEAR_MIN, YEAR_MAX, MIN_APPID,
+         MIN_PRICE_USD, ALLOW_FREE_TO_PLAY, SCHEMA_VERSION],
+        sort_keys=True).encode()).hexdigest()
+
+
+CONFIG_HASH = compute_config_hash()
 
 
 def load_checkpoint() -> dict:
@@ -702,9 +820,20 @@ def main():
     parser.add_argument("--skip-discovery", action="store_true", help="Skip discovery, use checkpoint")
     parser.add_argument("--with-histograms", action="store_true",
                         help="Also fetch monthly review histograms into histograms/ (adds ~1.5-2h)")
+    parser.add_argument("--config", default="",
+                        help="Cluster YAML config (default: cluster.yaml next to the script, if present)")
     args = parser.parse_args()
 
+    # Absolutize before chdir so a path relative to the caller's cwd
+    # (or a file drag&dropped onto run.bat) still resolves.
+    config_path = os.path.abspath(args.config) if args.config else ""
     os.chdir(Path(__file__).parent)
+
+    if not config_path and os.path.exists("cluster.yaml"):
+        config_path = "cluster.yaml"
+        print("Found cluster.yaml — using it")
+    if config_path:
+        apply_cluster_config(config_path)
 
     checkpoint = load_checkpoint()
 
@@ -713,7 +842,8 @@ def main():
         combos_by_appid = {int(k): v for k, v in checkpoint["appid_combos"].items()}
         print(f"Loaded {len(combos_by_appid)} appids from checkpoint")
     else:
-        verify_tag_ids()
+        if not config_path:
+            verify_tag_ids()  # config tags are already verified during resolution
         print("Phase 1: Discovering games by tags...")
         combos_by_appid = discover_all_appids()
         checkpoint["appid_combos"] = {str(k): v for k, v in combos_by_appid.items()}
@@ -883,20 +1013,20 @@ def main():
     df = pd.DataFrame(records)
     if len(df) > 0:
         df = df.sort_values("estimated_sales", ascending=False).reset_index(drop=True)
-        export_csv(df, "survival_rts_dataset.csv")
-        print(f"  Saved survival_rts_dataset.csv ({len(df)} games)")
+        export_csv(df, DATASET_CSV)
+        print(f"  Saved {DATASET_CSV} ({len(df)} games)")
 
     dropped_df = pd.DataFrame(drop_records)
     if len(dropped_df) > 0:
-        export_csv(dropped_df, "survival_rts_dropped.csv")
-        print(f"  Saved survival_rts_dropped.csv ({len(dropped_df)} games)")
+        export_csv(dropped_df, DROPPED_CSV)
+        print(f"  Saved {DROPPED_CSV} ({len(dropped_df)} games)")
     else:
         dropped_df = pd.DataFrame()
 
     unborn_df = pd.DataFrame(unborn_records)
     if len(unborn_df) > 0:
-        export_csv(unborn_df, "unborn.csv")
-        print(f"  Saved unborn.csv ({len(unborn_df)} unreleased games)")
+        export_csv(unborn_df, UNBORN_CSV)
+        print(f"  Saved {UNBORN_CSV} ({len(unborn_df)} unreleased games)")
 
     print_summary(df, dropped_df)
     if len(unborn_df) > 0:

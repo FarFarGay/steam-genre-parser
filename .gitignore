@@ -1,5 +1,9 @@
 checkpoint.json
+checkpoint_*.json
 *.csv
 parser_log.txt
 __pycache__/
 histograms/
+# personal cluster configs stay local; only cluster.example.yaml is shipped
+cluster.yaml
+smoke_*.yaml

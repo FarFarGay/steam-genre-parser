@@ -1,0 +1,53 @@
+# ============================================================
+#  Bring your own cluster — analyze ANY Steam niche.
+#
+#  1. Copy this file to  cluster.yaml  (same folder as the parser)
+#     or keep several configs and run:  run.bat --config my_niche.yaml
+#  2. Edit tags/pairs below. Tag names must match Steam exactly
+#     (as shown on store pages). Numeric ids are resolved for you.
+#  3. Double-click run.bat. Results land in {name}_dataset.csv.
+#
+#  Different configs keep separate checkpoints and output files,
+#  so you can research several niches side by side.
+# ============================================================
+
+# Short name for this cluster — used in output file names.
+name: my_niche
+
+# Release years to keep (inclusive).
+years: [2018, 2026]
+
+# Games cheaper than this (base price, USD) are dropped as shovelware.
+min_price_usd: 3.0
+
+# Keep free-to-play games? (default: false — premium market only)
+allow_free_to_play: false
+
+# --- The genre cluster ----------------------------------------
+# Tags with weights. A game must accumulate >= weight_min across
+# its top-20 Steam tags to stay in the dataset.
+#   1.0 = core signal    0.5 = partial signal
+tags:
+  Roguelike Deckbuilder: 1.0
+  Card Game: 1.0
+  Roguelike: 1.0
+  Turn-Based: 0.5
+  Singleplayer: 0.5
+
+weight_min: 2.0
+
+# Discovery pairs: the parser finds games having BOTH tags of a
+# pair. 2-6 pairs is the sweet spot — every pair adds discovery
+# time. Pair tags must be listed in tags: above.
+pairs:
+  - [Roguelike Deckbuilder, Card Game]
+  - [Roguelike Deckbuilder, Roguelike]
+
+# --- Rarely needed --------------------------------------------
+# Tags outside Steam's ~430 popular tags can't be resolved by
+# name. Give their numeric id here (see steamdb.info/tags):
+# tag_ids:
+#   Villain Protagonist: 11333
+
+# Skip appids below this (appid ~ registration date; 400000 ~ 2016).
+# min_appid: 400000

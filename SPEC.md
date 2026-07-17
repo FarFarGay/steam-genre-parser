@@ -320,7 +320,14 @@ Options:
   --limit N           Process only first N appids (for testing)
   --skip-discovery    Skip Phase 1, load appids from checkpoint
   --with-histograms   Also fetch monthly review histograms (adds ~1.5-2h)
+  --config PATH       Cluster YAML config (default: cluster.yaml if present)
 ```
+
+### Cluster Configs (bring-your-own-cluster)
+
+The built-in Action Base-Building cluster is just the default. A YAML config (`cluster.example.yaml` is the template) parameterizes the same engine for any niche: tag weights, discovery pairs, year range, price floor, F2P toggle, `weight_min`. Tag names are resolved to ids via Steam's popular-tags list at startup (hard exit with a helpful message for unknown names; rare tags take an explicit id under `tag_ids:`, verified by a live search probe).
+
+Per-cluster isolation: outputs are `{name}_dataset.csv` / `{name}_dropped.csv` / `{name}_unborn.csv`, the checkpoint is `checkpoint_{name}.json`, and the cluster parameters feed `config_hash` — clusters never mix. Personal configs (`cluster.yaml`) are gitignored; only the example ships.
 
 ### Typical Usage
 
@@ -371,6 +378,7 @@ After export, the script prints:
 | requests | >= 2.31.0 | HTTP client |
 | pandas | >= 2.0.0 | DataFrame operations, CSV export |
 | tqdm | >= 4.65.0 | Progress bar |
+| pyyaml | >= 6.0 | Cluster config files |
 
 Python 3.9+ (the `X | Y` annotation syntax is behind `from __future__ import annotations`).
 

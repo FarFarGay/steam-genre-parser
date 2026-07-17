@@ -8,6 +8,18 @@ Collects metadata for Action/Base Building/Physics/Destruction/Tower Defense gam
 pip install -r requirements.txt
 ```
 
+## Bring your own cluster
+
+You don't have to study *our* genre — point the parser at any Steam niche:
+
+1. Copy `cluster.example.yaml` to `cluster.yaml` (picked up automatically), or keep several configs side by side.
+2. Write your tags (names as shown on Steam — numeric ids are resolved and verified for you), discovery pairs, year range and price floor.
+3. Run it: `run.bat`, or `python parse_steam_genre.py --config my_niche.yaml`.
+
+Results land in `{name}_dataset.csv` / `{name}_dropped.csv` / `{name}_unborn.csv`; every cluster keeps its own checkpoint, so several researches can coexist in this folder.
+
+Please don't redistribute the collected datasets — Steam's data belongs to Steam and the developers; this tool is for your own market research.
+
 ## Usage
 
 ### Test run (first 20 games)
