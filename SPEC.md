@@ -1,10 +1,16 @@
 # Steam Action Base-Building Genre Parser — Specification
 
+## 0. Version History
+
+- **v1** (2026-07): Survival RTS cluster. Shipped with two broken tag ids and a tag scraper that Steam's `InitAppTagData` → `InitAppTagModal` rename had silently killed.
+- **v2** (2026-07-16): pivot to Action Base-Building — RTS/Strategy tags out, Action/Physics/Destruction in; ids fixed, scraper revived, age-gate cookies, base price, checkpoint config-hash. Full run completed 2026-07-16: 739 games / 3,989 dropped of 4,728 candidates.
+- **v3** (2026-07-17): "hand" blind-spot combos (Villain Protagonist, Physics+Destruction, Mechs), survivorship bias removed (`is_low_data` flag instead of review-count drop), `unborn.csv`, 12 new columns, request funnel + per-endpoint delays, atomic checkpoint, Excel-injection sanitization. Not yet run.
+
 ## 1. Purpose
 
 Automated collection of a structured dataset of Steam games in the Action / Base Building / Physics / Destruction / Tower Defense genre cluster, released 2018–2026, with metadata sufficient to estimate sales volume and build a market landscape analysis.
 
-The cluster definition pivoted on 2026-07-16: the game is defined through action (physical hand, destruction, melee) rather than RTS/strategy. RTS, Strategy, Real-Time with Pause and Action RTS tags were removed (Strategy sits on half of Steam — more noise than signal); Action, Physics, Destruction, Hack and Slash, Action RPG, Dungeon Crawler, Isometric, Top-Down and Mechs were added.
+The cluster definition pivoted on 2026-07-16: the game is defined through action (physical hand, destruction, melee) rather than RTS/strategy. RTS, Strategy, Real-Time with Pause and Action RTS tags were removed (Strategy sits on half of Steam — more noise than signal); Action, Physics, Destruction, Hack and Slash, Action RPG, Dungeon Crawler, Isometric, Top-Down and Mechs were added. v3 (2026-07-17) extended discovery toward the "hand without a base" power fantasy (Villain Protagonist, Physics + Destruction, Mechs + Action).
 
 The output is a clean CSV ready for Excel analysis, pitch deck slides, and genre research.
 
@@ -88,7 +94,8 @@ No `supportedlang` filter (removed in v3): English localization proxies for budg
 - 50 results per page
 - Iterate until `loaded >= total_count` or no results returned
 - 1.0s delay between pages
-- Exponential backoff on HTTP 429/5xx (max 3 retries)
+- Exponential backoff on HTTP 429/5xx (max 6 retries, up to 64s)
+- A combo that collects < 95% of its `total_count` logs an explicit coverage warning
 
 ### Pre-filter
 
@@ -156,14 +163,21 @@ Every 25 processed games, the full state is written to `checkpoint.json`:
 
 ```json
 {
-  "config_hash": "md5 of tags/combos/weights/years",
-  "appids": [700100, 700200, ...],
+  "config_hash": "md5 of tags/combos/weights/years/schema",
+  "appid_combos": {
+    "700100": ["Base Building + Action", "Survival + Base Building"],
+    ...
+  },
   "fetched": {
     "700100": { full game record },
     ...
   },
   "dropped": {
     "700200": { record + "drop_reason" },
+    ...
+  },
+  "unborn": {
+    "700300": { record with coming_soon=true },
     ...
   }
 }
@@ -269,9 +283,9 @@ Filters are applied in this order (1–3 before the HTML fetch, 4–5 after). Fi
 
 **Review count is a flag, not a filter (v3):** games with < 50 reviews stay in the dataset with `is_low_data=True`. Dropping them baked survivorship bias into the architecture; now it's a post-processing choice.
 
-### Relevant Tag Weights (for filter #6)
+### Relevant Tag Weights (for filter #5)
 
-All target tags weigh 1.0, except partial signals at 0.5: **Colony Sim** (seven dwarves are not a colony) and **Top-Down** (adjacent camera, partial credit). A game must accumulate total weight ≥ 2.0 across its top-10 tags.
+All target tags weigh 1.0, except partial signals at 0.5: **Colony Sim** (seven dwarves are not a colony) and **Top-Down** (adjacent camera, partial credit). A game must accumulate total weight ≥ 2.0 across its top-20 tags.
 
 ## 8. Output Files
 
@@ -334,6 +348,8 @@ After export, the script prints:
   - **Mid**: 50K–200K
   - **Below break-even**: < 50K
 - Top 10 games by estimated revenue
+- Unreleased pipeline size (unborn.csv)
+- Count of low-data games in the dataset (is_low_data=True)
 
 ## 11. Performance Characteristics
 
@@ -356,7 +372,7 @@ After export, the script prints:
 | pandas | >= 2.0.0 | DataFrame operations, CSV export |
 | tqdm | >= 4.65.0 | Progress bar |
 
-Python 3.10+ required (uses `X | Y` union type syntax).
+Python 3.9+ (the `X | Y` annotation syntax is behind `from __future__ import annotations`).
 
 ## 13. Known Limitations
 
@@ -369,11 +385,12 @@ Python 3.10+ required (uses `X | Y` union type syntax).
 - **No concurrent player history**: Would require a separate Steam Charts scrape.
 - **Rate limiting variability**: Steam's rate limits are not formally documented and can vary. The script may slow down during high-traffic periods.
 
-## 14. Out of Scope (v1)
+## 14. Out of Scope
 
 - Wishlist counts
 - Concurrent player history
-- Localization analysis
-- Update / DLC frequency
+- Deep localization analysis (only the `n_languages` count is collected)
+- Update / DLC frequency over time (only the `n_dlc` count is collected)
 - Trailer / video metadata
-- SteamSpy cross-validation
+- SteamSpy cross-validation (candidate for v4: tags from SteamSpy would offload the heaviest request to another host and add an independent `owners` estimate)
+- Parallel fetch lanes per endpoint (candidate for v4: ~2-2.5x speedup)

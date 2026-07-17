@@ -30,6 +30,11 @@ Note: the checkpoint stores a fingerprint of the tag/filter config. If you chang
 python parse_steam_genre.py --skip-discovery
 ```
 
+### With monthly review histograms (death diagnosis, +1.5-2h)
+```bash
+python parse_steam_genre.py --with-histograms
+```
+
 ## How long does it take?
 
 - **Discovery phase**: ~10-15 minutes (8 tag-pair combos)
@@ -70,6 +75,14 @@ python parse_steam_genre.py --skip-discovery
 | `steam_url` | Store page link |
 | `estimated_sales` | Boxleiter formula: reviews × year multiplier |
 | `estimated_revenue_usd` | sales × price × 0.45 (after cuts/discounts/refunds) |
+| `discovered_via` | Which tag pair(s) found the game — slice "shelf" vs "hand" |
+| `tag_weights` | Tags with vote counts (`name:count`) — signal intensity |
+| `is_low_data` | True when < 50 reviews (kept in dataset, not dropped) |
+| `coming_soon` / `has_demo` | Release/demo flags |
+| `price_final_usd` / `discount_percent` | Current (discounted) price info |
+| `categories` | Steam categories (co-op, Workshop, controller...) |
+| `n_languages` / `n_achievements` / `n_dlc` | Content breadth counters |
+| `recommendations` | Steam recommendations total (review-count cross-check) |
 
 ## Boxleiter multipliers
 
