@@ -51,8 +51,11 @@ IDs verified against `store.steampowered.com/tagdata/populartags/english` (2026-
 | Isometric | 5851 | camera — catches Riftbreaker, Cult of the Lamb |
 | Top-Down | 4791 | adjacent camera, half weight |
 | Mechs | 4821 | piloted machine (Riftbreaker) |
+| Villain Protagonist | 11333 | v3: Overlord-style power fantasy |
 
-### Tag Pair Combinations (5 total)
+All ids are re-verified at startup against `tagdata/populartags/english` (hard exit on mismatch); ids missing from that top-430 list are probed via live search instead.
+
+### Tag Pair Combinations (8 total)
 
 ```
 Base Building + Action          (primary)
@@ -60,7 +63,12 @@ Base Building + Physics
 Tower Defense + Action
 Base Building + Destruction
 Survival + Base Building        (catches the old v1 shelf)
+Villain Protagonist + Action    (v3: the "hand" blind spot)
+Physics + Destruction           (v3: hand without a base)
+Mechs + Action                  (v3: piloted machine)
 ```
+
+The first five are the stable v2 "shelf" — kept unchanged between runs for comparability. Hack and Slash + Isometric was evaluated (689 games) and rejected: it imports the whole Diablo ARPG shelf. Each appid records which combos found it (`discovered_via` column) so "shelf" and "hand" remain separable research questions.
 
 ### API Endpoint
 
@@ -68,11 +76,12 @@ Survival + Base Building        (catches the old v1 shelf)
 GET https://store.steampowered.com/search/results/
     ?tags={tag_id_1},{tag_id_2}
     &category1=998          # Games only (not DLC/software)
-    &supportedlang=english
     &count=50               # Per page
     &start={offset}         # Pagination
     &infinite=1             # JSON response
 ```
+
+No `supportedlang` filter (removed in v3): English localization proxies for budget/ambition, and CJK/RU-only failures are part of the cluster graveyard being studied.
 
 ### Pagination
 
@@ -83,11 +92,11 @@ GET https://store.steampowered.com/search/results/
 
 ### Pre-filter
 
-After discovery, appids < 700,000 are discarded. These correspond to games released before ~2017 and would all be filtered out later anyway. This saves significant API calls.
+After discovery, appids < 400,000 are discarded (registered before ~2016). appid correlates with registration date, not release: the old 700,000 cutoff silently lost games registered 2016–2017 but released 2018+ (long development = ambitious projects). The year filter drops actual pre-2018 releases downstream.
 
 ### Output
 
-A deduplicated set of appids stored in `checkpoint.json`.
+A deduplicated map of `appid → [combos that found it]` stored in `checkpoint.json` (`appid_combos`), exported as the `discovered_via` CSV column.
 
 ## 4. Phase 2 — Metadata Fetch
 
@@ -107,11 +116,20 @@ GET https://store.steampowered.com/appreviews/{appid}
 ```
 Returns: total_reviews, total_positive, review_score_desc.
 
-#### 3. User Tags (HTML scrape)
+#### 3. User Tags (HTML scrape) — fetched LAST, and only for survivors
+
+The store page is the heaviest request, so cheap filters (year, F2P, price) run first and the HTML is fetched only for games still alive — saves roughly a third of fetch-phase time. Tag-dependent filters (NSFW, tag weight) run after.
+
 ```
 GET https://store.steampowered.com/app/{appid}
 ```
-Tags are extracted from the `InitAppTagModal(appid, [...])` JavaScript call embedded in the page HTML (Steam renamed it from `InitAppTagData` at some point in 2026, which silently broke tag parsing until 2026-07-16). Top 20 tags by weight are captured.
+Tags are extracted from the `InitAppTagModal(appid, [...])` JavaScript call embedded in the page HTML (Steam renamed it from `InitAppTagData` at some point in 2026, which silently broke tag parsing until 2026-07-16). Top 20 tags are captured **with vote counts** (`tag_weights` column, `name:count; ...`) — signal intensity, not just presence.
+
+#### 4. Review histograms (optional, `--with-histograms`)
+```
+GET https://store.steampowered.com/appreviewhistogram/{appid}?l=english
+```
+For games with ≥1 review, raw monthly-review JSON is stored to `histograms/{appid}.json` (idempotent — existing files are skipped, so it can run as a second pass). Enables death diagnosis (dead-on-arrival vs died-after-launch) and correcting the 2026 right-censoring. Adds ~1.5–2h.
 
 The session carries age-gate cookies (`birthtime`, `lastagecheckage`, `wants_mature_content`) — without them, mature-rated games redirect to `/agecheck/` and return no tags.
 
@@ -153,7 +171,11 @@ On restart with `--skip-discovery`, already-processed appids are skipped.
 
 ## 5. Data Schema
 
-### Per-Game Record (19 fields)
+### Per-Game Record
+
+v3 additions on top of the v2 schema (all from responses already being fetched — zero new requests): `coming_soon`, `price_final_usd`, `discount_percent`, `has_demo`, `discovered_via`, `tag_weights`, `categories`, `n_languages`, `n_achievements`, `n_dlc`, `recommendations`, `is_low_data`.
+
+### Core fields (v2)
 
 | Field | Type | Source | Description |
 |-------|------|--------|-------------|
@@ -226,14 +248,16 @@ Games are dropped (with reason logged) if any condition is true:
 
 | # | Filter | Threshold | Rationale |
 |---|--------|-----------|-----------|
+| 0 | Unreleased | coming_soon, or no date + 0 reviews | Routed to `unborn.csv` (future-competitor pipeline), not dropped |
 | 1 | Release year | < 2018 or > 2026 | Scope limitation |
-| 2 | Review count | < 50 | Insufficient data for estimation |
-| 3 | Free-to-play | is_free = True | Premium segment only |
-| 4 | Price | < $3.00 | Removes asset flips and shovelware |
-| 5 | NSFW tags | "Sexual Content", "NSFW", "Hentai", "Adult Only" | Out of scope |
-| 6 | Relevant tag weight | < 2.0 (only when tags parsed successfully) | Must belong to genre cluster |
+| 2 | Free-to-play | is_free = True | Premium segment only |
+| 3 | Price | < $3.00 | Removes asset flips and shovelware |
+| 4 | NSFW tags | "Sexual Content", "NSFW", "Hentai", "Adult Only" | Out of scope |
+| 5 | Relevant tag weight | < 2.0 (only when tags parsed successfully) | Must belong to genre cluster |
 
-Filters are applied in this order. First matching rule determines the drop reason.
+Filters are applied in this order (1–3 before the HTML fetch, 4–5 after). First matching rule determines the drop reason.
+
+**Review count is a flag, not a filter (v3):** games with < 50 reviews stay in the dataset with `is_low_data=True`. Dropping them baked survivorship bias into the architecture; now it's a post-processing choice.
 
 ### Relevant Tag Weights (for filter #6)
 
@@ -249,6 +273,14 @@ Main dataset. Sorted by `estimated_sales` descending. UTF-8 with BOM for Excel c
 
 All filtered-out games with an additional `drop_reason` column. Same schema plus the reason field.
 
+### unborn.csv
+
+Unreleased (coming soon) games with the same schema — the pipeline of future competitors.
+
+### histograms/{appid}.json
+
+Raw monthly review histograms, only with `--with-histograms`. Gitignored.
+
 ### checkpoint.json
 
 Internal state for resume capability. Not intended for analysis.
@@ -259,8 +291,9 @@ Internal state for resume capability. Not intended for analysis.
 python parse_steam_genre.py [OPTIONS]
 
 Options:
-  --limit N          Process only first N appids (for testing)
-  --skip-discovery   Skip Phase 1, load appids from checkpoint
+  --limit N           Process only first N appids (for testing)
+  --skip-discovery    Skip Phase 1, load appids from checkpoint
+  --with-histograms   Also fetch monthly review histograms (adds ~1.5-2h)
 ```
 
 ### Typical Usage
@@ -294,14 +327,14 @@ After export, the script prints:
 
 | Metric | Value |
 |--------|-------|
-| Discovery phase | ~5–10 minutes |
-| Fetch speed | ~5.5–6.0 seconds per game |
-| Requests per game | 3 (details + reviews + tags) |
+| Discovery phase | ~10–15 minutes (8 combos) |
+| Fetch speed | ~4–6 seconds per game (HTML skipped for pre-tag drops) |
+| Requests per game | 2–4 (details + reviews; + tags for survivors; + histogram with flag) |
 | Delay between requests | 1.5 seconds |
 | Checkpoint interval | Every 25 games |
-| Typical total appids | ~4,000–5,000 |
-| Typical games after filter | ~700–900 |
-| Full run time | ~6–8 hours |
+| Typical total appids | ~7,000–8,000 (v3: new combos, no lang filter, MIN_APPID 400k) |
+| Typical dataset size | ~3,000–4,000 rows (low-data games kept, flagged) |
+| Full run time | ~9–12 hours (+1.5–2h with histograms) |
 
 ## 12. Dependencies
 

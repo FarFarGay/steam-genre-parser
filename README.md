@@ -32,9 +32,9 @@ python parse_steam_genre.py --skip-discovery
 
 ## How long does it take?
 
-- **Discovery phase**: ~5-10 minutes (scraping tag pages)
-- **Metadata phase**: ~1.5s delay × 3 requests per game × number of games
-  - 500 games ≈ 2-4 hours
+- **Discovery phase**: ~10-15 minutes (8 tag-pair combos)
+- **Metadata phase**: 2-4 requests per game with 1.5s delays (store HTML is only fetched for games that pass the cheap filters)
+  - Full v3 run (~7-8K apps) ≈ 9-12 hours; add ~1.5-2h with `--with-histograms`
   - With `--limit 20` ≈ 2 minutes
 
 ## Output files
@@ -43,6 +43,8 @@ python parse_steam_genre.py --skip-discovery
 |------|-------------|
 | `survival_rts_dataset.csv` | Main dataset, sorted by estimated sales descending |
 | `survival_rts_dropped.csv` | Filtered-out games with drop reason |
+| `unborn.csv` | Unreleased games (coming soon) — the future-competitor pipeline |
+| `histograms/{appid}.json` | Monthly review histograms (only with `--with-histograms`) |
 | `checkpoint.json` | Progress checkpoint for resume capability |
 
 ## CSV columns
@@ -82,8 +84,9 @@ python parse_steam_genre.py --skip-discovery
 
 Games are dropped if:
 - Release year outside 2018-2026
-- Fewer than 50 reviews
 - Free-to-play
 - Price under $3
 - NSFW/Sexual Content tags
 - Relevant tag weight below 2.0 (most cluster tags weigh 1.0; Colony Sim and Top-Down weigh 0.5)
+
+Games with fewer than 50 reviews are NOT dropped — they stay in the dataset flagged `is_low_data=True`, so the graveyard is analyzable (no survivorship bias). Unreleased games go to `unborn.csv` instead of dropped.

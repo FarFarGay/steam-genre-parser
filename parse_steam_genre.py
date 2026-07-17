@@ -41,6 +41,7 @@ TARGET_TAGS = {
     "Isometric": 5851,
     "Top-Down": 4791,
     "Mechs": 4821,
+    "Villain Protagonist": 11333,
 }
 
 # Weighted relevance for filter #6: a game must accumulate >= 2.0 to pass.
@@ -57,6 +58,7 @@ RELEVANT_TAG_WEIGHTS = {
     "Dungeon Crawler": 1.0,
     "Isometric": 1.0,
     "Mechs": 1.0,
+    "Villain Protagonist": 1.0,
     "Colony Sim": 0.5,
     "Top-Down": 0.5,
 }
@@ -66,6 +68,11 @@ NSFW_TAGS = {"Sexual Content", "NSFW", "Hentai", "Adult Only"}
 
 YEAR_MIN = 2018
 YEAR_MAX = 2026
+
+# appid correlates with registration date, not release. 400000 ≈ registered
+# 2016+: games registered in 2016-2017 but released 2018+ were silently lost
+# under the old 700000 cutoff; the year filter drops actual pre-2018 releases.
+MIN_APPID = 400000
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -149,13 +156,15 @@ def discover_appids_for_tag_combo(tag_ids: list[int], combo_name: str) -> set[in
 
     while True:
         url = "https://store.steampowered.com/search/results/"
+        # No supportedlang filter: it proxies for budget/ambition (localized
+        # into English = money), which would hide the CJK/RU-only graveyard
+        # of the cluster — failure cases are part of the research question.
         params = {
             "query": "",
             "start": page * 50,
             "count": 50,
             "tags": tags_param,
             "category1": 998,
-            "supportedlang": "english",
             "ndl": 1,
             "snr": "1_7_7_230_7",
             "infinite": 1,
@@ -198,27 +207,80 @@ def discover_appids_for_tag_combo(tag_ids: list[int], combo_name: str) -> set[in
     return appids
 
 
-# Tag combos: pairs that define our genre cluster (intersection, not union)
+# Tag combos: pairs that define our genre cluster (intersection, not union).
+# The first five are the v2 "shelf" — kept unchanged so runs stay comparable.
+# The v3 additions cover the "hand" blind spot: villain/physics power
+# fantasies without a base. (Hack and Slash + Isometric was considered and
+# rejected — it imports the whole Diablo ARPG shelf.)
 TAG_COMBOS = [
     ([7332, 19], "Base Building + Action"),
     ([7332, 3968], "Base Building + Physics"),
     ([1645, 19], "Tower Defense + Action"),
     ([7332, 5363], "Base Building + Destruction"),
     ([1662, 7332], "Survival + Base Building"),
+    # v3
+    ([11333, 19], "Villain Protagonist + Action"),
+    ([3968, 5363], "Physics + Destruction"),
+    ([4821, 19], "Mechs + Action"),
 ]
 
 
-def discover_all_appids() -> set[int]:
-    """Discover appids using tag pair combinations (intersections)."""
-    all_appids = set()
+def discover_all_appids() -> dict[int, list[str]]:
+    """Discover appids using tag pair combinations (intersections).
+
+    Returns {appid: [combo names it was found by]} — the combo list is kept
+    so the dataset can later be sliced into "shelf" vs "hand" research
+    questions (discovered_via column).
+    """
+    combos_by_appid: dict[int, list[str]] = {}
     for tag_ids, combo_name in TAG_COMBOS:
         tqdm.write(f"\nDiscovering: {combo_name}")
         found = discover_appids_for_tag_combo(tag_ids, combo_name)
-        all_appids.update(found)
+        for aid in found:
+            combos_by_appid.setdefault(aid, []).append(combo_name)
         time.sleep(1)
 
-    tqdm.write(f"\nTotal unique appids discovered: {len(all_appids)}")
-    return all_appids
+    tqdm.write(f"\nTotal unique appids discovered: {len(combos_by_appid)}")
+    return combos_by_appid
+
+
+def verify_tag_ids():
+    """Assert every TARGET_TAGS id against Steam's official tag list.
+
+    v1 shipped with two broken ids (Base Building, Colony Sim) and nobody
+    noticed for a full run — this makes that class of bug fail fast.
+    populartags only holds the ~430 most popular tags, so ids missing from
+    it are probed via a live search instead of failing the assert.
+    """
+    resp = polite_get("https://store.steampowered.com/tagdata/populartags/english")
+    if not resp:
+        print("WARNING: could not fetch tag list, skipping tag id verification")
+        return
+    try:
+        by_name = {t["name"]: t["tagid"] for t in resp.json()}
+    except Exception:
+        print("WARNING: could not parse tag list, skipping tag id verification")
+        return
+
+    for name, tid in TARGET_TAGS.items():
+        if name in by_name:
+            if by_name[name] != tid:
+                sys.exit(f"TAG ID MISMATCH: {name} is {by_name[name]} on Steam, "
+                         f"but TARGET_TAGS says {tid} — fix before running")
+        else:
+            resp = polite_get("https://store.steampowered.com/search/results/",
+                              {"query": "", "count": 1, "tags": tid, "infinite": 1})
+            total = 0
+            if resp:
+                try:
+                    total = resp.json().get("total_count", 0)
+                except Exception:
+                    pass
+            if not total:
+                sys.exit(f"TAG ID DEAD: {name}={tid} is not in populartags and "
+                         f"returns 0 search results — fix before running")
+            time.sleep(1.0)
+    print("Tag ids verified OK")
 
 
 # ---------------------------------------------------------------------------
@@ -269,8 +331,8 @@ def fetch_review_summary(appid: int) -> dict:
     return summary
 
 
-def fetch_app_tags(appid: int) -> list[str]:
-    """Fetch user-defined tags for an app from the store page."""
+def fetch_app_tags(appid: int) -> list[tuple[str, int]]:
+    """Fetch user-defined tags with vote counts from the store page."""
     url = f"https://store.steampowered.com/app/{appid}"
     resp = polite_get(url)
     if not resp:
@@ -285,9 +347,35 @@ def fetch_app_tags(appid: int) -> list[str]:
     try:
         raw = "[" + match.group(1) + "]"
         tags_data = json.loads(raw)
-        return [t.get("name", "") for t in tags_data[:20] if t.get("name")]
+        return [(t["name"], t.get("count", 0)) for t in tags_data[:20] if t.get("name")]
     except Exception:
         return []
+
+
+def fetch_review_histogram(appid: int) -> bool:
+    """Fetch the monthly review histogram and store the raw JSON.
+
+    Used for death diagnosis ("dead on arrival" vs "died after launch") and
+    to correct the 2026 right-censoring. Idempotent: skips existing files,
+    so a second --with-histograms pass only fetches what's missing.
+    """
+    out_path = os.path.join("histograms", f"{appid}.json")
+    if os.path.exists(out_path):
+        return True
+
+    resp = polite_get(f"https://store.steampowered.com/appreviewhistogram/{appid}",
+                      {"l": "english"})
+    if not resp:
+        return False
+    try:
+        data = resp.json()
+    except Exception:
+        return False
+
+    os.makedirs("histograms", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+    return True
 
 
 def parse_release_date(release_info: dict) -> tuple[str | None, int | None]:
@@ -319,23 +407,44 @@ def parse_release_date(release_info: dict) -> tuple[str | None, int | None]:
     return None, None
 
 
-def build_game_record(appid: int, details: dict, review_summary: dict, tags: list[str]) -> dict:
-    """Build a flat dict for one game."""
-    release_date, release_year = parse_release_date(details.get("release_date"))
+def count_languages(details: dict) -> int:
+    """Count supported languages from the HTML-ish supported_languages string."""
+    raw = details.get("supported_languages") or ""
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = raw.replace("languages with full audio support", "").replace("*", "")
+    return len([p for p in raw.split(",") if p.strip()])
 
-    price_data = details.get("price_overview", {})
+
+def build_game_record(appid: int, details: dict, review_summary: dict,
+                      discovered_via: list[str]) -> dict:
+    """Build a flat dict for one game.
+
+    Tag fields start empty — the store page is the heaviest request, so it
+    is only fetched for games that survive the cheap filters, and the tag
+    columns are filled in afterwards.
+    """
+    release_info = details.get("release_date") or {}
+    release_date, release_year = parse_release_date(release_info)
+
+    price_data = details.get("price_overview") or {}
     is_free = details.get("is_free", False)
     price_usd = None
+    price_final_usd = None
+    discount_percent = 0
     if is_free:
         price_usd = 0.0
+        price_final_usd = 0.0
     elif price_data:
         # "initial" is the base price; "final" is the current (possibly
         # discounted) one. The 0.45 revenue coefficient already accounts for
         # lifetime discounts, so using "final" would double-count sales.
         price_usd = price_data.get("initial", price_data.get("final", 0)) / 100.0
+        price_final_usd = price_data.get("final", 0) / 100.0
+        discount_percent = price_data.get("discount_percent", 0)
 
     genres = [g.get("description", "") for g in details.get("genres", [])]
     is_early_access = "Early Access" in genres
+    categories = [c.get("description", "") for c in details.get("categories", [])]
 
     platforms = details.get("platforms", {})
     platform_list = []
@@ -346,8 +455,8 @@ def build_game_record(appid: int, details: dict, review_summary: dict, tags: lis
     if platforms.get("linux"):
         platform_list.append("linux")
 
-    metacritic = details.get("metacritic", {})
-    metacritic_score = metacritic.get("score") if metacritic else None
+    metacritic = details.get("metacritic") or {}
+    metacritic_score = metacritic.get("score")
 
     total_reviews = review_summary.get("total_reviews", 0)
     positive_reviews = review_summary.get("total_positive", 0)
@@ -364,15 +473,27 @@ def build_game_record(appid: int, details: dict, review_summary: dict, tags: lis
         "publisher": "; ".join(details.get("publishers", [])),
         "release_date": release_date,
         "release_year": release_year,
+        "coming_soon": bool(release_info.get("coming_soon")),
         "price_usd": price_usd,
+        "price_final_usd": price_final_usd,
+        "discount_percent": discount_percent,
         "is_free": is_free,
         "is_early_access": is_early_access,
-        "tags": "; ".join(tags),
+        "has_demo": bool(details.get("demos")),
+        "discovered_via": "; ".join(discovered_via),
+        "tags": "",
+        "tag_weights": "",
         "genres": "; ".join(genres),
+        "categories": "; ".join(categories),
+        "n_languages": count_languages(details),
+        "n_achievements": (details.get("achievements") or {}).get("total", 0),
+        "n_dlc": len(details.get("dlc") or []),
         "total_reviews": total_reviews,
         "positive_reviews": positive_reviews,
         "positive_percentage": positive_pct,
         "review_score_desc": review_desc,
+        "recommendations": (details.get("recommendations") or {}).get("total", 0),
+        "is_low_data": total_reviews < 50,
         "platforms": ", ".join(platform_list),
         "metacritic_score": metacritic_score,
         "header_image_url": details.get("header_image", ""),
@@ -394,14 +515,16 @@ def has_nsfw_tags(tags: list[str]) -> bool:
     return any(t in NSFW_TAGS for t in tags)
 
 
-def filter_game(record: dict, tags: list[str]) -> str | None:
-    """Return drop reason or None if game passes all filters."""
+def filter_pre_tags(record: dict) -> str | None:
+    """Cheap filters that don't need the store page HTML.
+
+    Low review count is deliberately NOT a drop anymore — it is flagged as
+    is_low_data instead, so the graveyard stays in the dataset and the
+    analysis isn't built on survivorship bias.
+    """
     year = record.get("release_year")
     if year is None or year < YEAR_MIN or year > YEAR_MAX:
         return f"release_year={year} outside {YEAR_MIN}-{YEAR_MAX}"
-
-    if record.get("total_reviews", 0) < 50:
-        return f"total_reviews={record.get('total_reviews', 0)} < 50"
 
     if record.get("is_free"):
         return "is_free=True"
@@ -410,13 +533,18 @@ def filter_game(record: dict, tags: list[str]) -> str | None:
     if price is not None and price < 3:
         return f"price_usd={price} < 3"
 
-    if has_nsfw_tags(tags):
+    return None
+
+
+def filter_by_tags(tag_names: list[str]) -> str | None:
+    """Tag-dependent filters, applied only to games that passed filter_pre_tags."""
+    if has_nsfw_tags(tag_names):
         return "NSFW tags"
 
     # Only filter by tag weight if we actually got tags (parsing can fail)
-    if tags and relevant_tag_weight(tags) < RELEVANT_WEIGHT_MIN:
-        return (f"relevant tag weight {relevant_tag_weight(tags)} < {RELEVANT_WEIGHT_MIN}: "
-                f"{[t for t in tags if t in RELEVANT_TAG_WEIGHTS]}")
+    if tag_names and relevant_tag_weight(tag_names) < RELEVANT_WEIGHT_MIN:
+        return (f"relevant tag weight {relevant_tag_weight(tag_names)} < {RELEVANT_WEIGHT_MIN}: "
+                f"{[t for t in tag_names if t in RELEVANT_TAG_WEIGHTS]}")
 
     return None
 
@@ -430,7 +558,7 @@ def filter_game(record: dict, tags: list[str]) -> str | None:
 # rules, so it is discarded instead.
 CONFIG_HASH = hashlib.md5(json.dumps(
     [TARGET_TAGS, [c[0] for c in TAG_COMBOS], RELEVANT_TAG_WEIGHTS,
-     RELEVANT_WEIGHT_MIN, YEAR_MIN, YEAR_MAX],
+     RELEVANT_WEIGHT_MIN, YEAR_MIN, YEAR_MAX, MIN_APPID],
     sort_keys=True).encode()).hexdigest()
 
 
@@ -439,9 +567,10 @@ def load_checkpoint() -> dict:
         with open(CHECKPOINT_FILE, "r") as f:
             state = json.load(f)
         if state.get("config_hash") == CONFIG_HASH:
+            state.setdefault("unborn", {})
             return state
         print("Checkpoint was built with a different tag/filter config — starting fresh")
-    return {"config_hash": CONFIG_HASH, "fetched": {}, "dropped": {}}
+    return {"config_hash": CONFIG_HASH, "fetched": {}, "dropped": {}, "unborn": {}}
 
 
 def save_checkpoint(state: dict):
@@ -502,9 +631,11 @@ def print_summary(df: pd.DataFrame, dropped_df: pd.DataFrame):
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Steam Survival RTS Genre Parser")
+    parser = argparse.ArgumentParser(description="Steam Action Base-Building Genre Parser")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of apps to fetch (0=all)")
     parser.add_argument("--skip-discovery", action="store_true", help="Skip discovery, use checkpoint")
+    parser.add_argument("--with-histograms", action="store_true",
+                        help="Also fetch monthly review histograms into histograms/ (adds ~1.5-2h)")
     args = parser.parse_args()
 
     os.chdir(Path(__file__).parent)
@@ -512,21 +643,20 @@ def main():
     checkpoint = load_checkpoint()
 
     # --- Discovery ---
-    if args.skip_discovery and "appids" in checkpoint:
-        all_appids = set(checkpoint["appids"])
-        print(f"Loaded {len(all_appids)} appids from checkpoint")
+    if args.skip_discovery and "appid_combos" in checkpoint:
+        combos_by_appid = {int(k): v for k, v in checkpoint["appid_combos"].items()}
+        print(f"Loaded {len(combos_by_appid)} appids from checkpoint")
     else:
+        verify_tag_ids()
         print("Phase 1: Discovering games by tags...")
-        all_appids = discover_all_appids()
-        checkpoint["appids"] = list(all_appids)
+        combos_by_appid = discover_all_appids()
+        checkpoint["appid_combos"] = {str(k): v for k, v in combos_by_appid.items()}
         save_checkpoint(checkpoint)
 
-    # Skip appids below 700000 — these are almost always pre-2018 games
-    MIN_APPID = 700000
-    all_appids = {a for a in all_appids if a >= MIN_APPID}
-    print(f"After filtering appid >= {MIN_APPID}: {len(all_appids)} apps")
+    combos_by_appid = {a: c for a, c in combos_by_appid.items() if a >= MIN_APPID}
+    print(f"After filtering appid >= {MIN_APPID}: {len(combos_by_appid)} apps")
 
-    appids_list = sorted(all_appids)
+    appids_list = sorted(combos_by_appid)
     if args.limit > 0:
         appids_list = appids_list[:args.limit]
         print(f"\n--limit {args.limit}: processing only {len(appids_list)} apps")
@@ -536,8 +666,10 @@ def main():
 
     fetched = checkpoint.get("fetched", {})
     dropped = checkpoint.get("dropped", {})
+    unborn = checkpoint.get("unborn", {})
     records = []
     drop_records = []
+    unborn_records = []
     count = 0
 
     # Restore already-fetched records
@@ -545,8 +677,12 @@ def main():
         records.append(rec)
     for aid_str, drec in dropped.items():
         drop_records.append(drec)
+    for aid_str, urec in unborn.items():
+        unborn_records.append(urec)
 
-    already_done = set(int(k) for k in fetched.keys()) | set(int(k) for k in dropped.keys())
+    already_done = (set(int(k) for k in fetched.keys())
+                    | set(int(k) for k in dropped.keys())
+                    | set(int(k) for k in unborn.keys()))
     remaining = [a for a in appids_list if a not in already_done]
 
     print(f"  Already fetched: {len(already_done)}, remaining: {len(remaining)}")
@@ -584,15 +720,35 @@ def main():
             review_summary = fetch_review_summary(appid)
             time.sleep(DELAY)
 
-            # 3. Get tags
-            tags = fetch_app_tags(appid)
-            time.sleep(DELAY)
+            record = build_game_record(appid, details, review_summary,
+                                       combos_by_appid.get(appid, []))
 
-            # Build record
-            record = build_game_record(appid, details, review_summary, tags)
+            # Unreleased games are a pipeline of future competitors, not
+            # corpses — they go to unborn.csv instead of dropped.
+            if record["coming_soon"] or (record["release_date"] is None
+                                         and record["total_reviews"] == 0):
+                unborn_records.append(record)
+                unborn[str(appid)] = record
+                count += 1
+                if count % CHECKPOINT_EVERY == 0:
+                    save_checkpoint(checkpoint)
+                continue
 
-            # Filter
-            drop_reason = filter_game(record, tags)
+            # 3. Cheap filters first; the store page HTML (heaviest request)
+            # is only fetched for games that are still alive.
+            drop_reason = filter_pre_tags(record)
+            if drop_reason is None:
+                tag_pairs = fetch_app_tags(appid)
+                time.sleep(DELAY)
+                tag_names = [n for n, _ in tag_pairs]
+                record["tags"] = "; ".join(tag_names)
+                record["tag_weights"] = "; ".join(f"{n}:{c}" for n, c in tag_pairs)
+                drop_reason = filter_by_tags(tag_names)
+
+            if args.with_histograms and record["total_reviews"] >= 1:
+                fetch_review_histogram(appid)
+                time.sleep(DELAY)
+
             if drop_reason:
                 record["drop_reason"] = drop_reason
                 drop_records.append(record)
@@ -605,6 +761,7 @@ def main():
             if count % CHECKPOINT_EVERY == 0:
                 checkpoint["fetched"] = fetched
                 checkpoint["dropped"] = dropped
+                checkpoint["unborn"] = unborn
                 save_checkpoint(checkpoint)
     except KeyboardInterrupt:
         tqdm.write("\nInterrupted — saving checkpoint and writing partial CSV...")
@@ -612,6 +769,7 @@ def main():
     # Final save
     checkpoint["fetched"] = fetched
     checkpoint["dropped"] = dropped
+    checkpoint["unborn"] = unborn
     save_checkpoint(checkpoint)
 
     # --- Build DataFrames and export ---
@@ -630,7 +788,16 @@ def main():
     else:
         dropped_df = pd.DataFrame()
 
+    unborn_df = pd.DataFrame(unborn_records)
+    if len(unborn_df) > 0:
+        unborn_df.to_csv("unborn.csv", index=False, encoding="utf-8-sig")
+        print(f"  Saved unborn.csv ({len(unborn_df)} unreleased games)")
+
     print_summary(df, dropped_df)
+    if len(unborn_df) > 0:
+        print(f"Unreleased pipeline (unborn.csv): {len(unborn_df)}")
+    if len(df) > 0 and "is_low_data" in df.columns:
+        print(f"Low-data games in dataset (<50 reviews, is_low_data=True): {int(df['is_low_data'].sum())}")
 
 
 if __name__ == "__main__":
