@@ -33,8 +33,8 @@ python parse_steam_genre.py --skip-discovery
 ## How long does it take?
 
 - **Discovery phase**: ~10-15 minutes (8 tag-pair combos)
-- **Metadata phase**: 2-4 requests per game with 1.5s delays (store HTML is only fetched for games that pass the cheap filters)
-  - Full v3 run (~7-8K apps) ≈ 9-12 hours; add ~1.5-2h with `--with-histograms`
+- **Metadata phase**: request funnel — details always; reviews and store HTML only for games that pass the cheap filters. Per-endpoint delays (1.5s / 0.75s / 1.0s)
+  - Full v3 run (~7-8K apps) ≈ 6-8 hours; add ~1.5-2h with `--with-histograms`
   - With `--limit 20` ≈ 2 minutes
 
 ## Output files

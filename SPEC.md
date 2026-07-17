@@ -100,21 +100,25 @@ A deduplicated map of `appid → [combos that found it]` stored in `checkpoint.j
 
 ## 4. Phase 2 — Metadata Fetch
 
-### Per-Game API Calls (3 requests per game)
+### Per-Game API Calls (1-4 requests per game, cheapest first)
 
-#### 1. App Details
+Request order is a funnel: each stage is only paid for games the previous
+stage kept alive. Games dropped by the year/F2P/price filters cost exactly
+one request; their review columns stay empty in dropped.csv.
+
+#### 1. App Details — always
 ```
 GET https://store.steampowered.com/api/appdetails
     ?appids={appid}&cc=us&l=en
 ```
-Returns: name, developer, publisher, release date, price, genres, platforms, metacritic score, header image, is_free flag, app type.
+Returns: name, developer, publisher, release date, price, genres, platforms, metacritic score, header image, is_free flag, app type. Everything the cheap filters (year, F2P, price) and the unborn check need.
 
-#### 2. Review Summary
+#### 2. Review Summary — only for games that pass the cheap filters
 ```
 GET https://store.steampowered.com/appreviews/{appid}
     ?json=1&num_per_page=0&language=all&purchase_type=all
 ```
-Returns: total_reviews, total_positive, review_score_desc.
+Returns: total_reviews, total_positive, review_score_desc. (Also fetched for the rare no-date-no-coming_soon case, where the review count decides between unborn and dropped.)
 
 #### 3. User Tags (HTML scrape) — fetched LAST, and only for survivors
 
@@ -137,9 +141,9 @@ The session carries age-gate cookies (`birthtime`, `lastagecheckage`, `wants_mat
 
 ### Rate Limiting
 
-- 1.5s delay between each API request
-- Exponential backoff on HTTP 429, 500, 502, 503
-- Max 3 retries per request
+- Per-endpoint delays: 1.5s appdetails (strictest, ~200 req/5min), 0.75s reviews/histograms, 1.0s store pages
+- Exponential backoff on HTTP 429, 500, 502, 503 (up to 64s)
+- Max 6 retries per request
 - Custom User-Agent: `SurvivalRTSResearch/1.0 (research bot)`
 
 ### Early Rejection
@@ -328,13 +332,13 @@ After export, the script prints:
 | Metric | Value |
 |--------|-------|
 | Discovery phase | ~10–15 minutes (8 combos) |
-| Fetch speed | ~4–6 seconds per game (HTML skipped for pre-tag drops) |
-| Requests per game | 2–4 (details + reviews; + tags for survivors; + histogram with flag) |
-| Delay between requests | 1.5 seconds |
+| Fetch speed | ~2s per cheap-dropped game, ~4.5s per surviving game |
+| Requests per game | 1–4 (details always; reviews + tags only for survivors; + histogram with flag) |
+| Delay between requests | 1.5s details / 0.75s reviews / 1.0s store pages |
 | Checkpoint interval | Every 25 games |
 | Typical total appids | ~7,000–8,000 (v3: new combos, no lang filter, MIN_APPID 400k) |
 | Typical dataset size | ~3,000–4,000 rows (low-data games kept, flagged) |
-| Full run time | ~9–12 hours (+1.5–2h with histograms) |
+| Full run time | ~6–8 hours (+1.5–2h with histograms) |
 
 ## 12. Dependencies
 

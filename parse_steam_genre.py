@@ -87,7 +87,12 @@ SESSION.cookies.update({
     "wants_mature_content": "1",
 })
 
-DELAY = 1.5
+# Per-endpoint politeness: appdetails is the strictest API (~200 req/5min),
+# the reviews endpoint and store pages tolerate noticeably more. polite_get's
+# exponential backoff catches it if Steam disagrees.
+DELAY = 1.5           # appdetails
+DELAY_REVIEWS = 0.75  # appreviews / appreviewhistogram
+DELAY_HTML = 1.0      # store pages (tag scrape)
 CHECKPOINT_FILE = "checkpoint.json"
 CHECKPOINT_EVERY = 25
 
@@ -415,13 +420,13 @@ def count_languages(details: dict) -> int:
     return len([p for p in raw.split(",") if p.strip()])
 
 
-def build_game_record(appid: int, details: dict, review_summary: dict,
+def build_game_record(appid: int, details: dict, review_summary: dict | None,
                       discovered_via: list[str]) -> dict:
     """Build a flat dict for one game.
 
-    Tag fields start empty — the store page is the heaviest request, so it
-    is only fetched for games that survive the cheap filters, and the tag
-    columns are filled in afterwards.
+    Review and tag fields start empty (pass review_summary=None) — those
+    requests are only spent on games that survive the cheap filters, and the
+    fields are filled in afterwards via apply_review_fields / directly.
     """
     release_info = details.get("release_date") or {}
     release_date, release_year = parse_release_date(release_info)
@@ -458,15 +463,7 @@ def build_game_record(appid: int, details: dict, review_summary: dict,
     metacritic = details.get("metacritic") or {}
     metacritic_score = metacritic.get("score")
 
-    total_reviews = review_summary.get("total_reviews", 0)
-    positive_reviews = review_summary.get("total_positive", 0)
-    positive_pct = round(positive_reviews / total_reviews * 100, 1) if total_reviews > 0 else 0
-    review_desc = review_summary.get("review_score_desc", "")
-
-    est_sales = estimate_sales(total_reviews, release_year) if release_year else 0
-    est_revenue = estimate_revenue_usd(est_sales, price_usd) if price_usd is not None else 0
-
-    return {
+    record = {
         "appid": appid,
         "name": details.get("name", ""),
         "developer": "; ".join(details.get("developers", [])),
@@ -488,19 +485,42 @@ def build_game_record(appid: int, details: dict, review_summary: dict,
         "n_languages": count_languages(details),
         "n_achievements": (details.get("achievements") or {}).get("total", 0),
         "n_dlc": len(details.get("dlc") or []),
-        "total_reviews": total_reviews,
-        "positive_reviews": positive_reviews,
-        "positive_percentage": positive_pct,
-        "review_score_desc": review_desc,
+        "total_reviews": None,
+        "positive_reviews": None,
+        "positive_percentage": None,
+        "review_score_desc": "",
         "recommendations": (details.get("recommendations") or {}).get("total", 0),
-        "is_low_data": total_reviews < 50,
+        "is_low_data": None,
         "platforms": ", ".join(platform_list),
         "metacritic_score": metacritic_score,
         "header_image_url": details.get("header_image", ""),
         "steam_url": f"https://store.steampowered.com/app/{appid}",
-        "estimated_sales": est_sales,
-        "estimated_revenue_usd": round(est_revenue, 2),
+        "estimated_sales": 0,
+        "estimated_revenue_usd": 0,
     }
+    if review_summary is not None:
+        apply_review_fields(record, review_summary)
+    return record
+
+
+def apply_review_fields(record: dict, review_summary: dict):
+    """Fill review-derived fields. Separate from build_game_record so the
+    reviews request can be skipped entirely for games the cheap filters drop
+    (their review columns stay empty in dropped.csv)."""
+    total = review_summary.get("total_reviews", 0)
+    positive = review_summary.get("total_positive", 0)
+    record["total_reviews"] = total
+    record["positive_reviews"] = positive
+    record["positive_percentage"] = round(positive / total * 100, 1) if total > 0 else 0
+    record["review_score_desc"] = review_summary.get("review_score_desc", "")
+    record["is_low_data"] = total < 50
+
+    year = record.get("release_year")
+    price = record.get("price_usd")
+    est_sales = estimate_sales(total, year) if year else 0
+    record["estimated_sales"] = est_sales
+    est_revenue = estimate_revenue_usd(est_sales, price) if price is not None else 0
+    record["estimated_revenue_usd"] = round(est_revenue, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -716,17 +736,12 @@ def main():
                     save_checkpoint(checkpoint)
                 continue
 
-            # 2. Get reviews
-            review_summary = fetch_review_summary(appid)
-            time.sleep(DELAY)
-
-            record = build_game_record(appid, details, review_summary,
+            record = build_game_record(appid, details, None,
                                        combos_by_appid.get(appid, []))
 
             # Unreleased games are a pipeline of future competitors, not
             # corpses — they go to unborn.csv instead of dropped.
-            if record["coming_soon"] or (record["release_date"] is None
-                                         and record["total_reviews"] == 0):
+            if record["coming_soon"]:
                 unborn_records.append(record)
                 unborn[str(appid)] = record
                 count += 1
@@ -734,20 +749,40 @@ def main():
                     save_checkpoint(checkpoint)
                 continue
 
-            # 3. Cheap filters first; the store page HTML (heaviest request)
-            # is only fetched for games that are still alive.
+            # No parseable date without a coming_soon flag: only the review
+            # count separates "quietly unreleased" from "released, odd date
+            # format" — worth the extra request for this rare case.
+            if record["release_date"] is None:
+                apply_review_fields(record, fetch_review_summary(appid))
+                time.sleep(DELAY_REVIEWS)
+                if record["total_reviews"] == 0:
+                    unborn_records.append(record)
+                    unborn[str(appid)] = record
+                    count += 1
+                    if count % CHECKPOINT_EVERY == 0:
+                        save_checkpoint(checkpoint)
+                    continue
+
+            # 2. Cheap filters (year/F2P/price) come straight from details —
+            # games they drop never cost the reviews or store-page requests.
             drop_reason = filter_pre_tags(record)
             if drop_reason is None:
+                # 3. Reviews only for games still alive
+                if record["total_reviews"] is None:
+                    apply_review_fields(record, fetch_review_summary(appid))
+                    time.sleep(DELAY_REVIEWS)
+
+                # 4. Store page HTML (heaviest request) last
                 tag_pairs = fetch_app_tags(appid)
-                time.sleep(DELAY)
+                time.sleep(DELAY_HTML)
                 tag_names = [n for n, _ in tag_pairs]
                 record["tags"] = "; ".join(tag_names)
                 record["tag_weights"] = "; ".join(f"{n}:{c}" for n, c in tag_pairs)
                 drop_reason = filter_by_tags(tag_names)
 
-            if args.with_histograms and record["total_reviews"] >= 1:
+            if args.with_histograms and (record["total_reviews"] or 0) >= 1:
                 fetch_review_histogram(appid)
-                time.sleep(DELAY)
+                time.sleep(DELAY_REVIEWS)
 
             if drop_reason:
                 record["drop_reason"] = drop_reason
