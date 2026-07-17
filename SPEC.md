@@ -171,7 +171,13 @@ Every 25 processed games, the full state is written to `checkpoint.json`:
 
 On restart with `--skip-discovery`, already-processed appids are skipped.
 
-`config_hash` fingerprints everything that affects dataset membership (tags, combos, weights, year range). A checkpoint built under a different config is discarded on load — otherwise old and new filter rules would silently mix. Transient fetch failures are NOT checkpointed, so the next run retries them. `KeyboardInterrupt` saves the checkpoint and still writes the partial CSVs.
+`config_hash` fingerprints everything that affects dataset membership (tags, combos, weights, year range, MIN_APPID) plus `SCHEMA_VERSION` (bumped when the column set changes) — a checkpoint built under a different config or schema is discarded on load, otherwise old and new rules/columns would silently mix.
+
+Robustness guarantees:
+- **Atomic writes**: the checkpoint is written to a temp file and `os.replace`d — a kill mid-write can never corrupt it (readers also never see a half-written file).
+- **Corruption recovery**: an unreadable checkpoint logs a warning and starts fresh instead of crashing.
+- **Transient failures are NOT checkpointed** — a failed appdetails *or* reviews request skips the game for this run and retries it next run. A failed reviews request is never recorded as "0 reviews" (that would poison sales estimates permanently).
+- `KeyboardInterrupt` saves the checkpoint and still writes the partial CSVs.
 
 ## 5. Data Schema
 
@@ -273,6 +279,8 @@ All target tags weigh 1.0, except partial signals at 0.5: **Colony Sim** (seven 
 
 Main dataset. Sorted by `estimated_sales` descending. UTF-8 with BOM for Excel compatibility.
 
+All CSV exports are sanitized against Excel formula injection: Steam-controlled strings (names, developers, tags) starting with `=` `+` `-` `@` get a leading apostrophe so Excel treats them as text, not formulas.
+
 ### survival_rts_dropped.csv
 
 All filtered-out games with an additional `drop_reason` column. Same schema plus the reason field.
@@ -355,6 +363,8 @@ Python 3.10+ required (uses `X | Y` union type syntax).
 - **Tag parsing unreliable**: Steam may block or change the page structure for `InitAppTagModal` (it already renamed the call once). When tags fail to parse, the tag-weight filter is bypassed (safe because discovery already ensures the game matched a tag pair).
 - **Price is current base price, not launch price**: discounts are excluded (`initial`), but permanent price changes since launch are not.
 - **Boxleiter is an approximation**: Actual sales can vary 2–3x from the estimate. The formula is best used for relative comparison within the dataset, not absolute numbers.
+- **Bundle-only rows missed**: search rows with multi-id `data-ds-appid="111,222"` (package listings) don't match the discovery regex — games sold only in bundles are skipped.
+- **n_languages is approximate**: parsed from Steam's HTML-ish language string, ±1 possible.
 - **No wishlist data**: Wishlists are not publicly available via Steam API.
 - **No concurrent player history**: Would require a separate Steam Charts scrape.
 - **Rate limiting variability**: Steam's rate limits are not formally documented and can vary. The script may slow down during high-traffic periods.

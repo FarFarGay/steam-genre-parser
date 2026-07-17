@@ -313,8 +313,14 @@ def fetch_app_details(appid: int) -> dict | None:
     return app_data.get("data")
 
 
-def fetch_review_summary(appid: int) -> dict:
-    """Fetch review counts from Steam reviews API."""
+def fetch_review_summary(appid: int) -> dict | None:
+    """Fetch review counts from Steam reviews API.
+
+    Returns None on transient failure. A real Steam answer always carries
+    total_reviews (0-review games included), so callers can tell "request
+    failed" from "no reviews" — recording zeros from a failed request would
+    permanently poison the dataset via the checkpoint.
+    """
     url = f"https://store.steampowered.com/appreviews/{appid}"
     params = {
         "json": 1,
@@ -325,14 +331,16 @@ def fetch_review_summary(appid: int) -> dict:
 
     resp = polite_get(url, params)
     if not resp:
-        return {}
+        return None
 
     try:
         data = resp.json()
     except Exception:
-        return {}
+        return None
 
-    summary = data.get("query_summary", {})
+    summary = data.get("query_summary") or {}
+    if "total_reviews" not in summary:
+        return None
     return summary
 
 
@@ -573,30 +581,68 @@ def filter_by_tags(tag_names: list[str]) -> str | None:
 # Checkpoint
 # ---------------------------------------------------------------------------
 
+# Bump when the record schema (set of CSV columns) changes: checkpointed
+# records built with another column set must not mix into this run, even if
+# the tag/filter config itself is unchanged.
+SCHEMA_VERSION = 3
+
 # Fingerprint of everything that affects which games end up in the dataset.
 # A checkpoint built under a different config would silently mix old and new
 # rules, so it is discarded instead.
 CONFIG_HASH = hashlib.md5(json.dumps(
     [TARGET_TAGS, [c[0] for c in TAG_COMBOS], RELEVANT_TAG_WEIGHTS,
-     RELEVANT_WEIGHT_MIN, YEAR_MIN, YEAR_MAX, MIN_APPID],
+     RELEVANT_WEIGHT_MIN, YEAR_MIN, YEAR_MAX, MIN_APPID, SCHEMA_VERSION],
     sort_keys=True).encode()).hexdigest()
 
 
 def load_checkpoint() -> dict:
     if os.path.exists(CHECKPOINT_FILE):
-        with open(CHECKPOINT_FILE, "r") as f:
-            state = json.load(f)
-        if state.get("config_hash") == CONFIG_HASH:
-            state.setdefault("unborn", {})
-            return state
-        print("Checkpoint was built with a different tag/filter config — starting fresh")
+        try:
+            with open(CHECKPOINT_FILE, "r") as f:
+                state = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            print("WARNING: checkpoint.json is corrupted — starting fresh")
+        else:
+            if state.get("config_hash") == CONFIG_HASH:
+                state.setdefault("unborn", {})
+                return state
+            print("Checkpoint was built with a different tag/filter config — starting fresh")
     return {"config_hash": CONFIG_HASH, "fetched": {}, "dropped": {}, "unborn": {}}
 
 
 def save_checkpoint(state: dict):
+    # Atomic write: a kill mid-dump must never leave a corrupted checkpoint
+    # (that would cost the whole run's progress). os.replace is atomic on
+    # both Windows and POSIX; readers also never see a half-written file.
     state["config_hash"] = CONFIG_HASH
-    with open(CHECKPOINT_FILE, "w") as f:
+    tmp_path = CHECKPOINT_FILE + ".tmp"
+    with open(tmp_path, "w") as f:
         json.dump(state, f)
+    os.replace(tmp_path, CHECKPOINT_FILE)
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+def excel_safe(df: pd.DataFrame) -> pd.DataFrame:
+    """Neutralize Excel formula injection before CSV export.
+
+    Game names / developers / tags are attacker-controlled strings from
+    Steam; a value starting with = + - @ executes as a formula when the CSV
+    is opened in Excel. Such cells get a leading apostrophe (Excel's own
+    "treat as text" marker).
+    """
+    df = df.copy()
+    for col in df.columns:
+        if df[col].dtype == object:
+            df[col] = df[col].map(
+                lambda v: "'" + v if isinstance(v, str) and v[:1] in ("=", "+", "-", "@") else v)
+    return df
+
+
+def export_csv(df: pd.DataFrame, path: str) -> None:
+    excel_safe(df).to_csv(path, index=False, encoding="utf-8-sig")
 
 
 # ---------------------------------------------------------------------------
@@ -753,8 +799,19 @@ def main():
             # count separates "quietly unreleased" from "released, odd date
             # format" — worth the extra request for this rare case.
             if record["release_date"] is None:
-                apply_review_fields(record, fetch_review_summary(appid))
+                summary = fetch_review_summary(appid)
                 time.sleep(DELAY_REVIEWS)
+                if summary is None:
+                    # Transient — not checkpointed, retried next run
+                    drop_records.append({
+                        "appid": appid, "name": record["name"],
+                        "drop_reason": "failed to fetch reviews (will retry next run)"
+                    })
+                    count += 1
+                    if count % CHECKPOINT_EVERY == 0:
+                        save_checkpoint(checkpoint)
+                    continue
+                apply_review_fields(record, summary)
                 if record["total_reviews"] == 0:
                     unborn_records.append(record)
                     unborn[str(appid)] = record
@@ -769,8 +826,19 @@ def main():
             if drop_reason is None:
                 # 3. Reviews only for games still alive
                 if record["total_reviews"] is None:
-                    apply_review_fields(record, fetch_review_summary(appid))
+                    summary = fetch_review_summary(appid)
                     time.sleep(DELAY_REVIEWS)
+                    if summary is None:
+                        # Transient — not checkpointed, retried next run
+                        drop_records.append({
+                            "appid": appid, "name": record["name"],
+                            "drop_reason": "failed to fetch reviews (will retry next run)"
+                        })
+                        count += 1
+                        if count % CHECKPOINT_EVERY == 0:
+                            save_checkpoint(checkpoint)
+                        continue
+                    apply_review_fields(record, summary)
 
                 # 4. Store page HTML (heaviest request) last
                 tag_pairs = fetch_app_tags(appid)
@@ -780,15 +848,17 @@ def main():
                 record["tag_weights"] = "; ".join(f"{n}:{c}" for n, c in tag_pairs)
                 drop_reason = filter_by_tags(tag_names)
 
-            if args.with_histograms and (record["total_reviews"] or 0) >= 1:
-                fetch_review_histogram(appid)
-                time.sleep(DELAY_REVIEWS)
-
             if drop_reason:
                 record["drop_reason"] = drop_reason
                 drop_records.append(record)
                 dropped[str(appid)] = record
             else:
+                # Histograms only for games that enter the dataset — the
+                # cluster graveyard lives there (is_low_data), while
+                # tag-dropped games are foreign and not worth the request.
+                if args.with_histograms and (record["total_reviews"] or 0) >= 1:
+                    fetch_review_histogram(appid)
+                    time.sleep(DELAY_REVIEWS)
                 records.append(record)
                 fetched[str(appid)] = record
 
@@ -813,19 +883,19 @@ def main():
     df = pd.DataFrame(records)
     if len(df) > 0:
         df = df.sort_values("estimated_sales", ascending=False).reset_index(drop=True)
-        df.to_csv("survival_rts_dataset.csv", index=False, encoding="utf-8-sig")
+        export_csv(df, "survival_rts_dataset.csv")
         print(f"  Saved survival_rts_dataset.csv ({len(df)} games)")
 
     dropped_df = pd.DataFrame(drop_records)
     if len(dropped_df) > 0:
-        dropped_df.to_csv("survival_rts_dropped.csv", index=False, encoding="utf-8-sig")
+        export_csv(dropped_df, "survival_rts_dropped.csv")
         print(f"  Saved survival_rts_dropped.csv ({len(dropped_df)} games)")
     else:
         dropped_df = pd.DataFrame()
 
     unborn_df = pd.DataFrame(unborn_records)
     if len(unborn_df) > 0:
-        unborn_df.to_csv("unborn.csv", index=False, encoding="utf-8-sig")
+        export_csv(unborn_df, "unborn.csv")
         print(f"  Saved unborn.csv ({len(unborn_df)} unreleased games)")
 
     print_summary(df, dropped_df)
